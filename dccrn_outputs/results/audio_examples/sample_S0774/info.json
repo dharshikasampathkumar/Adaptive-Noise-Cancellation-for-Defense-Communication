@@ -1,0 +1,9 @@
+{
+  "sample_id": "S0774",
+  "target_snr_db": 15.0,
+  "measured_input_snr_db": 15.0,
+  "output_reconstruction_snr_db": -1.4429376554576696,
+  "snr_improvement_db": -16.44293765545767,
+  "noise_category": "gunshot",
+  "clipped_for_wav": false
+}

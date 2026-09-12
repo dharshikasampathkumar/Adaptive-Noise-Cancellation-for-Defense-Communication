@@ -1,0 +1,9 @@
+{
+  "sample_id": "S0011",
+  "target_snr_db": -5.0,
+  "measured_input_snr_db": -5.0,
+  "output_reconstruction_snr_db": -1.9138256761494354,
+  "snr_improvement_db": 3.086174323850565,
+  "noise_category": "armored_vehicle",
+  "clipped_for_wav": false
+}

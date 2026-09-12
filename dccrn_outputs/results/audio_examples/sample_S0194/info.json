@@ -1,0 +1,9 @@
+{
+  "sample_id": "S0194",
+  "target_snr_db": 0.0,
+  "measured_input_snr_db": 0.0,
+  "output_reconstruction_snr_db": -1.8182819112964679,
+  "snr_improvement_db": -1.8182819112964679,
+  "noise_category": "artillery",
+  "clipped_for_wav": false
+}

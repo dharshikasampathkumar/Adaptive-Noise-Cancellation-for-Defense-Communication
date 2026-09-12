@@ -1,0 +1,69 @@
+======================================================================
+ DEFENCE SPEECH ENHANCEMENT DATASET – GENERATION SUMMARY
+======================================================================
+Generated on        : 2026-09-11 23:51:31
+Random seed         : 42
+
+─── 1. INPUT DATASET ───────────────────────────────────────────────
+Clean speech files inspected : 1000
+Valid clean speech files     : 1000
+Noise files inspected        : 693
+Valid noise files            : 683
+Corrupted/rejected files     : 10
+
+─── 2. OUTPUT DATASET ──────────────────────────────────────────────
+Target samples               : 1000
+Final noisy samples          : 1000
+QC failures (excluded)       : 0
+
+─── 3. SAMPLES PER SNR LEVEL ───────────────────────────────────────
+  SNR  -5 dB  :  167 samples | mean_measured=-5.0000 dB | mean_error=0.0000 dB
+  SNR  +0 dB  :  167 samples | mean_measured=0.0000 dB | mean_error=0.0000 dB
+  SNR  +5 dB  :  167 samples | mean_measured=5.0000 dB | mean_error=0.0000 dB
+  SNR +10 dB  :  167 samples | mean_measured=10.0000 dB | mean_error=0.0000 dB
+  SNR +15 dB  :  166 samples | mean_measured=15.0000 dB | mean_error=0.0000 dB
+  SNR +20 dB  :  166 samples | mean_measured=20.0000 dB | mean_error=0.0000 dB
+
+─── 4. NOISE CATEGORY DISTRIBUTION ────────────────────────────────
+  armored_vehicle         :  144 samples
+  artillery               :  144 samples
+  drone                   :  144 samples
+  siren                   :  144 samples
+  gunshot                 :  144 samples
+  helicopter              :  142 samples
+  wind                    :  138 samples
+
+─── 5. TRAIN / VALIDATION / TEST ───────────────────────────────────
+  Train      : 800
+  Validation : 100
+  Test       : 100
+
+─── 6. SNR ERROR STATISTICS ────────────────────────────────────────
+  Min SNR error     : 0.0000 dB
+  Max SNR error     : 0.0000 dB
+  Mean |SNR error|  : 0.0000 dB
+  Flagged (>3.0dB): 0
+
+─── 7. QUALITY CONTROL ─────────────────────────────────────────────
+  QC failures       : 0
+  Samples passing   : 1000
+
+─── 8. AUDIO FORMAT ────────────────────────────────────────────────
+  Format      : WAV (PCM, uncompressed)
+  Bit depth   : 16-bit
+  Channels    : Mono (1)
+  Sample rate : 16000 Hz
+
+─── 9. NOISE CATEGORIES ────────────────────────────────────────────
+  armored_vehicle, artillery, drone, siren, gunshot, helicopter, wind
+
+─── 10. LIMITATIONS & WARNINGS ─────────────────────────────────────
+  None
+
+─── NOTES ──────────────────────────────────────────────────────────
+  • Synthetically generated for Tiny DCCRN training.
+  • SNR formula: SNR(dB) = 10*log10(P_speech / P_noise)
+  • Noise looped/tiled if shorter than speech duration.
+  • Anti-clipping preserves SNR by uniform scaling.
+  • NOT real military recordings.
+======================================================================

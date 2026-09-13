@@ -19,6 +19,18 @@
     ],
     "si_snr_weight": 1.0,
     "spectral_loss_weight": 1.0,
+    "amplitude_loss_weight": 0.3,
+    "full_val_metrics_every": 5,
+    "waveform_loss_weight": 50.0,
+    "snr_sampling_weights": {
+      "-5.0": 3.0,
+      "0.0": 2.5,
+      "5.0": 2.0,
+      "10.0": 1.0,
+      "15.0": 1.0,
+      "20.0": 1.0
+    },
+    "use_snr_weighted_sampling": true,
     "random_seed": 42,
     "patience": 15,
     "output_dir": "C:\\SIH\\dccrn_outputs"

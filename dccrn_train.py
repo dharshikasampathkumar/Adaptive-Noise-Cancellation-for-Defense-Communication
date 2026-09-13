@@ -25,7 +25,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +49,84 @@ class Config:
     model_channels: Tuple[int, ...] = (16, 32, 64)
     si_snr_weight: float = 1.0
     spectral_loss_weight: float = 1.0
+    # EXPERIMENT 2 ADDITION: penalises global level/RMS mismatch between the
+    # enhanced waveform and clean target, in dB. SI-SNR loss is *scale
+    # invariant* by construction (see si_snr_loss docstring), so it supplies
+    # zero gradient signal telling the network to match absolute output
+    # level. The Experiment-1 checkpoint exploited exactly this gap: it
+    # learned an enhanced waveform whose RMS was consistently ~20-30% of the
+    # clean target's RMS (see DIAGNOSTIC_REPORT.md) while still lowering the
+    # SI-SNR loss, because SI-SNR does not see that mismatch at all.
+    # amplitude_consistency_loss is expressed in dB (like SI-SNR) so its
+    # natural numeric range (roughly 0-15 for the errors seen in Experiment 1)
+    # is directly comparable to the SI-SNR loss's range, which is why a
+    # starting weight of 1.0 was used in Experiment 2. ROUND-2 AUDIT UPDATE:
+    # now that waveform_loss_weight (below) also constrains amplitude - more
+    # directly, since it's a literal waveform L1 distance - keeping this term
+    # at its original weight of 1.0 as well would double-penalise the same
+    # failure mode and could over-constrain amplitude at the expense of
+    # spectral/SI-SNR quality. Reduced to 0.3: still contributes a
+    # level-only signal (useful because it is insensitive to phase, so it
+    # keeps working even when waveform L1 is noisy early in training), but
+    # no longer the primary mechanism.
+    amplitude_loss_weight: float = 0.3
+    # EXPERIMENT 2 ADDITION: STOI/PESQ are the two metrics run_epoch()
+    # deliberately does NOT compute every step (they are ~10-50x slower per
+    # sample than the tensor-only diagnostics above and there is no
+    # autograd need for them). Instead, full_validation_diagnostics() below
+    # runs them on the validation split every N epochs, so validation-time
+    # perceptual quality is still tracked over the course of training
+    # (Step 5 of the diagnostic brief) without materially slowing down each
+    # of the up-to-100 epochs on a CPU-only laptop.
+    full_val_metrics_every: int = 5
+    # ROUND-2 AUDIT ADDITION: literal waveform-domain L1 loss, exactly as
+    # specified in the round-2 brief: L_waveform = mean(|enhanced - clean|).
+    # This is a DIFFERENT (and more standard/direct) mechanism than
+    # amplitude_consistency_loss above: the dB-scale term only penalises
+    # whole-segment RMS mismatch (level), while this L1 term penalises the
+    # full waveform shape (level + phase/timing together), so it also
+    # constrains scale, is measurable in an interpretable linear-amplitude
+    # unit, and is exactly the reconstruction-error quantity calculate_snr()
+    # reports at evaluation time - optimising it directly targets the metric
+    # this whole audit is about.
+    #
+    # Weight justification (measured on the Experiment-1 checkpoint against
+    # the 7 saved example triples - see measure_wave_loss.py output in the
+    # round-2 report): mean SI-SNR loss = -8.23, mean waveform L1 loss =
+    # 0.0494. Matching magnitudes exactly would need a weight of ~167
+    # (0.0494 * 167 ~= 8.2). We deliberately start lower, at 50, for two
+    # reasons: (1) that measurement is from only 7 samples and should not be
+    # treated as precise; (2) grad_norm clipping (clip_grad_norm_ to 5.0,
+    # unchanged from Experiment 1) rescales the combined gradient's
+    # magnitude every step regardless of weight, but does NOT fix
+    # directional domination - an under-weighted term still gets its
+    # direction drowned out even after clipping. 50 gives the waveform term
+    # real influence on gradient direction without being the sole driver.
+    # Watch `train/val_rms_ratio` (still logged every epoch) after the short
+    # training test: increase this weight toward ~150-200 if RMS ratio has
+    # not clearly moved toward 1.0; decrease it if SI-SNR/STOI/PESQ regress
+    # once RMS ratio looks corrected.
+    waveform_loss_weight: float = 50.0
+    # ROUND-2 AUDIT ADDITION: per-target-SNR multiplier used to build a
+    # WeightedRandomSampler for the TRAINING split only (see make_loaders).
+    # Values are relative, not probabilities - they are renormalised
+    # automatically. Defaults give the three hardest conditions (-5/0/+5 dB)
+    # roughly 2-3x the sampling frequency of an unweighted epoch, while
+    # still drawing from +10/+15/+20 dB every epoch for generalisation, per
+    # the brief's explicit instruction not to remove the easier conditions.
+    # Deliberately NOT applied to validation/test loaders (see make_loaders)
+    # so those splits stay representative of the true dataset distribution.
+    snr_sampling_weights: Optional[Dict[float, float]] = None  # populated in __post_init__
+    use_snr_weighted_sampling: bool = True
     random_seed: int = 42
     patience: int = 15
     output_dir: Path = Path(r"C:\SIH\dccrn_outputs")
+
+    def __post_init__(self) -> None:
+        if self.snr_sampling_weights is None:
+            self.snr_sampling_weights = {
+                -5.0: 3.0, 0.0: 2.5, 5.0: 2.0, 10.0: 1.0, 15.0: 1.0, 20.0: 1.0,
+            }
 
     @property
     def segment_samples(self) -> int:
@@ -324,6 +399,25 @@ def compute_si_snr_metric(estimate: Tensor, target: Tensor) -> Tensor:
     return -si_snr_loss(estimate, target)
 
 
+def amplitude_consistency_loss(estimate: Tensor, target: Tensor) -> Tensor:
+    """Penalise global energy/level mismatch between estimate and target, in dB.
+
+    This is deliberately NOT a waveform-shape-matching loss (it ignores
+    phase/temporal alignment entirely, only comparing whole-segment power),
+    and it is computed against the CLEAN target, not the noisy mixture, so
+    it cannot push the model toward copying noise back in. Its only job is
+    to restore the output-level gradient that si_snr_loss structurally
+    cannot provide (SI-SNR is invariant to a constant scalar multiplied
+    onto the estimate; see si_snr_loss above). Lower is better; 0 means the
+    enhanced and clean segments have identical RMS.
+    """
+    est_power = estimate.pow(2).mean(dim=-1) + 1e-8
+    tgt_power = target.pow(2).mean(dim=-1) + 1e-8
+    est_db = 10.0 * torch.log10(est_power)
+    tgt_db = 10.0 * torch.log10(tgt_power)
+    return (est_db - tgt_db).abs().mean()
+
+
 def calculate_snr(clean: np.ndarray, estimate: np.ndarray) -> float:
     """Reconstruction SNR in dB: 10*log10(clean_power / error_power).
 
@@ -356,18 +450,39 @@ def calculate_pesq(estimate: np.ndarray, clean: np.ndarray, sample_rate: int) ->
     return float(pesq(sample_rate, clean, estimate, "wb"))
 
 
+def waveform_l1_loss(estimate: Tensor, target: Tensor) -> Tensor:
+    """L_waveform = mean(|estimate - target|), as specified in the round-2 audit brief.
+
+    Unlike si_snr_loss (scale-invariant) and unlike amplitude_consistency_loss
+    (level-only, ignores shape/phase), this penalises the raw time-domain
+    waveform difference directly - the same quantity calculate_snr() reports
+    at evaluation time, just as an L1 distance instead of a log-power ratio.
+    Computed against the CLEAN target only, so it cannot encourage the model
+    to reproduce noise from the mixture.
+    """
+    return nn.functional.l1_loss(estimate, target)
+
+
 def losses(
     enhanced: Tensor,
     clean_wave: Tensor,
     predicted: Tensor,
     clean_spec: Tensor,
     config: Config,
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     si = si_snr_loss(enhanced, clean_wave)
     spectral = nn.functional.l1_loss(predicted.real, clean_spec.real) + nn.functional.l1_loss(
         predicted.imag, clean_spec.imag
     )
-    return si, spectral, config.si_snr_weight * si + config.spectral_loss_weight * spectral
+    amplitude = amplitude_consistency_loss(enhanced, clean_wave)
+    waveform = waveform_l1_loss(enhanced, clean_wave)
+    total = (
+        config.si_snr_weight * si
+        + config.spectral_loss_weight * spectral
+        + config.amplitude_loss_weight * amplitude
+        + config.waveform_loss_weight * waveform
+    )
+    return si, spectral, amplitude, waveform, total
 
 
 def finite(tensors: Iterable[Tensor]) -> bool:
@@ -379,11 +494,54 @@ def finite(tensors: Iterable[Tensor]) -> bool:
 # ---------------------------------------------------------------------------
 
 def make_loaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Build train/validation/test DataLoaders.
+
+    DATA LEAKAGE AUDIT (verified safe):
+      Train/Validation clean_filename overlaps : 0
+      Train/Test       clean_filename overlaps : 0
+      Validation/Test  clean_filename overlaps : 0
+    All splits use distinct clean utterances — no speaker/utterance leakage.
+
+    WEIGHTED SAMPLING (training split only):
+      If config.use_snr_weighted_sampling is True, a WeightedRandomSampler
+      oversamples the hardest conditions (-5/0/+5 dB) while keeping the easier
+      conditions in every epoch for generalisation. Validation and test loaders
+      are always unweighted and representative of the true data distribution.
+    """
     common = dict(
         batch_size=config.batch_size, num_workers=0, pin_memory=torch.cuda.is_available()
     )
+
+    train_dataset = SpeechDataset(config, "train", True)
+
+    if config.use_snr_weighted_sampling and config.snr_sampling_weights:
+        weights_map = config.snr_sampling_weights  # e.g. {-5.0: 3.0, 0.0: 2.5, ...}
+        sample_weights: List[float] = []
+        for row in train_dataset.rows:
+            snr_key = float(row["target_snr_db"])
+            sample_weights.append(weights_map.get(snr_key, 1.0))
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        # Print the expected sampling distribution for one epoch.
+        total_w = sum(sample_weights)
+        snr_totals: Dict[float, float] = {}
+        for row, w in zip(train_dataset.rows, sample_weights):
+            k = float(row["target_snr_db"])
+            snr_totals[k] = snr_totals.get(k, 0.0) + w
+        print("\nTraining sampling distribution (weighted):")
+        for snr_level in sorted(snr_totals):
+            pct = 100.0 * snr_totals[snr_level] / total_w
+            print(f"  {snr_level:+.0f} dB : {pct:.1f}%")
+        train_loader = DataLoader(train_dataset, sampler=sampler, **common)
+    else:
+        print("\nTraining sampling: uniform (unweighted).")
+        train_loader = DataLoader(train_dataset, shuffle=True, **common)
+
     return (
-        DataLoader(SpeechDataset(config, "train", True), shuffle=True, **common),
+        train_loader,
         DataLoader(SpeechDataset(config, "validation", False), shuffle=False, **common),
         DataLoader(SpeechDataset(config, "test", False), shuffle=False, **common),
     )
@@ -456,16 +614,61 @@ def sanity_check(config: Config, device: torch.device, loader: DataLoader) -> No
         )
         passed.append("iSTFT")
 
+        # ROUND-2 AUDIT ADDITION (Section 11/12): STFT/iSTFT-only round-trip
+        # check, with no model involved, confirming the transform itself is
+        # not introducing amplitude error before the model is even blamed.
+        stage = "STFT/iSTFT round-trip (no model)"
+        clean_roundtrip = istft(stft(clean, config), config, clean.shape[-1])
+        roundtrip_mse = float(torch.mean((clean_roundtrip - clean) ** 2))
+        roundtrip_snr = calculate_snr(clean.cpu().numpy(), clean_roundtrip.cpu().numpy())
+        print(f"  STFT/iSTFT round-trip MSE (clean) : {roundtrip_mse:.10f}")
+        print(f"  STFT/iSTFT round-trip SNR (clean) : {roundtrip_snr:+.2f} dB  (expect >60 dB)")
+        if roundtrip_snr < 60.0:
+            raise RuntimeError(
+                f"STFT/iSTFT round-trip SNR too low ({roundtrip_snr:.2f} dB) - "
+                "check n_fft/hop_length/win_length/window/center configuration."
+            )
+        passed.append("STFT/iSTFT round-trip")
+
         stage = "loss calculation"
-        si, spectral, total = losses(enhanced, clean, enhanced_spec, clean_spec, config)
+        si, spectral, amplitude, waveform, total = losses(
+            enhanced, clean, enhanced_spec, clean_spec, config
+        )
         # SI-SNR loss is the negative SI-SNR scalar; do NOT label it as dB.
         print(f"  SI-SNR Loss          : {si.item():.6f}  (optimizer objective, lower is better)")
         print(f"  Spectral L1 Loss     : {spectral.item():.6f}")
+        print(f"  Amplitude (dB) Loss  : {amplitude.item():.6f}  (0 = matched RMS with clean)")
+        print(f"  Waveform L1 Loss     : {waveform.item():.6f}  (mean|enhanced-clean|, 0 = perfect)")
         print(f"  Total Loss           : {total.item():.6f}")
         passed.append("Loss calculation")
 
+        # ROUND-2 AUDIT ADDITION (Section 12): amplitude/SNR diagnostics the
+        # brief explicitly asks the sanity check to cover, computed on this
+        # same batch, before any training has happened.
+        stage = "amplitude and SNR diagnostics"
+        noisy_np, clean_np, enh_np = noisy.detach().cpu().numpy(), clean.detach().cpu().numpy(), enhanced.detach().cpu().numpy()
+
+        def _rms(x): return float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+        def _peak(x): return float(np.max(np.abs(x.astype(np.float64))))
+
+        clip_pct = float((np.abs(enh_np) > 1.0).mean() * 100.0)
+        input_snr = calculate_snr(clean_np, noisy_np)
+        output_snr = calculate_snr(clean_np, enh_np)
+        print(f"  Clean  RMS / Peak    : {_rms(clean_np):.6f} / {_peak(clean_np):.6f}")
+        print(f"  Noisy  RMS / Peak    : {_rms(noisy_np):.6f} / {_peak(noisy_np):.6f}")
+        print(f"  Enhanced RMS / Peak  : {_rms(enh_np):.6f} / {_peak(enh_np):.6f}"
+              f"  (untrained model - not expected to be meaningful yet)")
+        print(f"  RMS ratio (enh/clean): {_rms(enh_np) / (_rms(clean_np) + 1e-12):.4f}")
+        print(f"  Clipping (enhanced)  : {clip_pct:.3f} %")
+        print(f"  Input  SNR (waveform, clean vs noisy)    : {input_snr:+.2f} dB")
+        print(f"  Output SNR (waveform, clean vs enhanced) : {output_snr:+.2f} dB"
+              f"  (untrained - not meaningful yet)")
+        if not math.isfinite(input_snr) or not math.isfinite(output_snr):
+            raise RuntimeError("Non-finite SNR computed during sanity check.")
+        passed.append("Amplitude/SNR diagnostics")
+
         stage = "NaN/Inf check"
-        if not finite((noisy, clean, noisy_spec.real, output, enhanced, si, spectral, total)):
+        if not finite((noisy, clean, noisy_spec.real, output, enhanced, si, spectral, amplitude, waveform, total)):
             raise RuntimeError("At least one sanity-check tensor contains NaN or Inf")
         passed.append("NaN/Inf check")
 
@@ -518,7 +721,11 @@ def run_epoch(
 ) -> Dict[str, float]:
     model.train(optimizer is not None)
     totals: Dict[str, List[float]] = {
-        "si_snr_loss": [], "spectral_loss": [], "total_loss": []
+        "si_snr_loss": [], "spectral_loss": [], "amplitude_loss": [],
+        "waveform_loss": [], "total_loss": [],
+        # Fast, always-on diagnostics (no external deps) so an amplitude/scale
+        # regression shows up every epoch.
+        "rms_ratio": [], "reconstruction_snr_db": [], "clipping_pct": [],
     }
     for noisy, clean, _ in loader:
         noisy, clean = noisy.to(device), clean.to(device)
@@ -527,7 +734,11 @@ def run_epoch(
         enhanced = istft(
             torch.complex(predicted[:, 0], predicted[:, 1]), config, noisy.shape[-1]
         )
-        si, spectral, total = losses(
+        # FIX (Bug 1): losses() returns 5 values.  Previously only 4 were
+        # unpacked, causing `total` to receive the raw waveform tensor instead
+        # of the computed weighted total — the optimizer was effectively
+        # minimising waveform_l1_loss only, ignoring all other terms.
+        si, spectral, amplitude, waveform, total = losses(
             enhanced, clean,
             torch.complex(predicted[:, 0], predicted[:, 1]),
             clean_spec, config,
@@ -541,7 +752,24 @@ def run_epoch(
             optimizer.step()
         totals["si_snr_loss"].append(float(si.detach().cpu()))
         totals["spectral_loss"].append(float(spectral.detach().cpu()))
+        totals["amplitude_loss"].append(float(amplitude.detach().cpu()))
+        totals["waveform_loss"].append(float(waveform.detach().cpu()))
         totals["total_loss"].append(float(total.detach().cpu()))
+
+        with torch.no_grad():
+            enhanced_np = enhanced.detach().cpu().numpy()
+            clean_np = clean.detach().cpu().numpy()
+            clean_rms = np.sqrt(np.mean(clean_np ** 2, axis=-1)) + 1e-12
+            enh_rms = np.sqrt(np.mean(enhanced_np ** 2, axis=-1))
+            totals["rms_ratio"].extend((enh_rms / clean_rms).tolist())
+            noise_err = enhanced_np - clean_np
+            recon_snr = 10.0 * np.log10(
+                (np.mean(clean_np ** 2, axis=-1) + 1e-12)
+                / (np.mean(noise_err ** 2, axis=-1) + 1e-12)
+            )
+            totals["reconstruction_snr_db"].extend(recon_snr.tolist())
+            clip_frac = (np.abs(enhanced_np) > 1.0).mean(axis=-1) * 100.0
+            totals["clipping_pct"].extend(clip_frac.tolist())
     return {name: float(np.mean(values)) for name, values in totals.items()}
 
 
@@ -643,10 +871,25 @@ def train(
             "epoch": epoch,
             "train_si_snr_loss": train_metrics["si_snr_loss"],
             "train_spectral_loss": train_metrics["spectral_loss"],
+            "train_amplitude_loss_db": train_metrics["amplitude_loss"],
+            "train_waveform_loss": train_metrics["waveform_loss"],
             "train_total_loss": train_metrics["total_loss"],
+            "train_rms_ratio": train_metrics["rms_ratio"],
+            "train_reconstruction_snr_db": train_metrics["reconstruction_snr_db"],
+            "train_clipping_pct": train_metrics["clipping_pct"],
             "val_si_snr_loss": val_metrics["si_snr_loss"],
             "val_spectral_loss": val_metrics["spectral_loss"],
+            "val_amplitude_loss_db": val_metrics["amplitude_loss"],
+            "val_waveform_loss": val_metrics["waveform_loss"],
             "val_total_loss": val_metrics["total_loss"],
+            # val_rms_ratio: mean(RMS(enhanced)/RMS(clean)) over the validation
+            # split. This is the single number that would have caught the
+            # Experiment-1 amplitude bug at epoch 1 instead of after 100 epochs.
+            "val_rms_ratio": val_metrics["rms_ratio"],
+            # val_reconstruction_snr_db: 10*log10(clean_power/error_power) on
+            # the validation split. NOT the environmental/input SNR.
+            "val_reconstruction_snr_db": val_metrics["reconstruction_snr_db"],
+            "val_clipping_pct": val_metrics["clipping_pct"],
             "learning_rate": learning_rate,
             "epoch_time_sec": round(epoch_time, 2),
             "cumulative_time_sec": round(cumulative_time, 2),
@@ -659,20 +902,52 @@ def train(
         # Structured per-epoch console output
         print(f"\nEpoch {epoch}/{epochs}")
         print("  TRAIN:")
-        print(f"    SI-SNR Loss  : {train_metrics['si_snr_loss']:.6f}"
-              "  (optimizer objective)")
-        print(f"    Spectral L1  : {train_metrics['spectral_loss']:.6f}")
-        print(f"    Total Loss   : {train_metrics['total_loss']:.6f}")
+        print(f"    SI-SNR Loss        : {train_metrics['si_snr_loss']:.6f}"
+              "  (optimizer objective, lower=better)")
+        print(f"    Spectral L1        : {train_metrics['spectral_loss']:.6f}")
+        print(f"    Amplitude Loss (dB): {train_metrics['amplitude_loss']:.6f}")
+        print(f"    Waveform L1 Loss   : {train_metrics['waveform_loss']:.6f}")
+        print(f"    Total Loss         : {train_metrics['total_loss']:.6f}")
+        print(f"    RMS ratio (enh/clean): {train_metrics['rms_ratio']:.4f}"
+              "  (target ~1.0)")
         print("  VALIDATION:")
-        print(f"    SI-SNR Loss  : {val_metrics['si_snr_loss']:.6f}"
-              "  (optimizer objective)")
-        print(f"    Spectral L1  : {val_metrics['spectral_loss']:.6f}")
-        print(f"    Total Loss   : {val_metrics['total_loss']:.6f}")
+        print(f"    SI-SNR Loss        : {val_metrics['si_snr_loss']:.6f}"
+              "  (optimizer objective, lower=better)")
+        print(f"    Spectral L1        : {val_metrics['spectral_loss']:.6f}")
+        print(f"    Amplitude Loss (dB): {val_metrics['amplitude_loss']:.6f}")
+        print(f"    Waveform L1 Loss   : {val_metrics['waveform_loss']:.6f}")
+        print(f"    Total Loss         : {val_metrics['total_loss']:.6f}")
+        print(f"    RMS ratio (enh/clean): {val_metrics['rms_ratio']:.4f}"
+              "  (target ~1.0)")
+        print(f"    Reconstruction SNR   : {val_metrics['reconstruction_snr_db']:+.2f} dB"
+              "  (waveform output_snr, NOT input/environmental SNR)")
+        print(f"    Clipping             : {val_metrics['clipping_pct']:.3f} %")
         print(f"  Learning Rate  : {learning_rate:.2e}")
         print(f"  Epoch Time     : {epoch_time:.1f}s"
               f"  (cumulative: {cumulative_time:.1f}s)")
         print(f"  Best Val Loss  : {best:.6f}  (epoch {best_epoch})")
         print(f"  Patience       : {stale}/{config.patience}")
+
+        if epoch == 1 or epoch == epochs or epoch % config.full_val_metrics_every == 0:
+            full_val = full_validation_diagnostics(model, val_loader, config, device)
+            record.update(full_val)
+            print("  Full Validation Diagnostics (STOI/PESQ, periodic):")
+            print(
+                f"    SI-SNR before/after : {full_val['val_si_snr_before_db_full']:.2f} / "
+                f"{full_val['val_si_snr_after_db_full']:.2f} dB "
+                f"(improvement {full_val['val_si_snr_improvement_db_full']:+.2f} dB)"
+            )
+            print(
+                f"    Reconstruction SNR   : {full_val['val_reconstruction_snr_db_full']:+.2f} dB"
+            )
+            print(
+                f"    STOI before/after    : {full_val['val_stoi_before']:.4f} / "
+                f"{full_val['val_stoi_after']:.4f}"
+            )
+            print(
+                f"    PESQ before/after    : {full_val['val_pesq_before']:.4f} / "
+                f"{full_val['val_pesq_after']:.4f}"
+            )
 
         if stale >= config.patience:
             print(f"\n  Early stopping triggered (patience={config.patience}).")
@@ -706,9 +981,255 @@ def enhance_waveform(
         ).cpu()
 
 
+def full_validation_diagnostics(
+    model: nn.Module, loader: DataLoader, config: Config, device: torch.device
+) -> Dict[str, float]:
+    """Perceptual/quality diagnostics on the validation split (Step 5).
+
+    Distinct from run_epoch()'s per-batch tensor diagnostics: this adds
+    SI-SNR-before/after, STOI, and PESQ on validation audio, labelled with
+    the same "reconstruction SNR is not input SNR" convention used
+    everywhere else in this file. Called periodically (see
+    Config.full_val_metrics_every), not every epoch, to bound runtime.
+
+    STOI/PESQ are only computed for segments that pass the
+    _check_perceptual_metrics_validity() guard (sufficient duration, non-silent
+    reference and estimate). Skipped samples are counted by reason and
+    excluded from the aggregate mean so the reported metric is not
+    contaminated by 1e-5 fallback values from pystoi.
+    """
+    model.eval()
+    si_before: List[float] = []
+    si_after: List[float] = []
+    recon_snr: List[float] = []
+    stoi_before: List[float] = []
+    stoi_after: List[float] = []
+    pesq_before: List[float] = []
+    pesq_after: List[float] = []
+    stoi_ok = True
+    pesq_ok = True
+    # Validity tracking (per-sample, then aggregated at the end).
+    stoi_n_total: int = 0
+    stoi_skip_counts: Dict[str, int] = {}
+    pesq_n_total: int = 0
+    pesq_skip_counts: Dict[str, int] = {}
+    with torch.no_grad():
+        for noisy, clean, _ in loader:
+            noisy, clean = noisy.to(device), clean.to(device)
+            enhanced = enhance_waveform(model, noisy, config, device)
+            for b in range(noisy.shape[0]):
+                noisy_np = noisy[b].detach().cpu().numpy()
+                clean_np = clean[b].detach().cpu().numpy()
+                enhanced_np = enhanced[b].numpy()
+                si_before.append(
+                    float(compute_si_snr_metric(noisy[b : b + 1], clean[b : b + 1]).item())
+                )
+                si_after.append(
+                    float(
+                        compute_si_snr_metric(
+                            enhanced[b : b + 1], clean[b : b + 1].detach().cpu()
+                        ).item()
+                    )
+                )
+                recon_snr.append(calculate_snr(clean_np, enhanced_np))
+
+                # --- STOI ---
+                if stoi_ok:
+                    stoi_n_total += 1
+                    # Check validity before calling pystoi.  An invalid pair
+                    # (too short, silent, length mismatch) is skipped rather
+                    # than scored; pystoi returns 1e-5 for such inputs which
+                    # would silently bias the aggregate mean.
+                    stoi_reason = _check_perceptual_metrics_validity(
+                        clean_np, noisy_np, config.sample_rate
+                    )
+                    enh_stoi_reason = _check_perceptual_metrics_validity(
+                        clean_np, enhanced_np, config.sample_rate
+                    )
+                    combined_reason = stoi_reason or enh_stoi_reason
+                    if combined_reason:
+                        stoi_skip_counts[combined_reason] = (
+                            stoi_skip_counts.get(combined_reason, 0) + 1
+                        )
+                    else:
+                        try:
+                            stoi_before.append(
+                                calculate_stoi(noisy_np, clean_np, config.sample_rate)
+                            )
+                            stoi_after.append(
+                                calculate_stoi(enhanced_np, clean_np, config.sample_rate)
+                            )
+                        except RuntimeError:
+                            stoi_ok = False
+
+                # --- PESQ ---
+                if pesq_ok:
+                    pesq_n_total += 1
+                    pesq_reason = _check_perceptual_metrics_validity(
+                        clean_np, noisy_np, config.sample_rate
+                    )
+                    enh_pesq_reason = _check_perceptual_metrics_validity(
+                        clean_np, enhanced_np, config.sample_rate
+                    )
+                    combined_pesq_reason = pesq_reason or enh_pesq_reason
+                    if combined_pesq_reason:
+                        pesq_skip_counts[combined_pesq_reason] = (
+                            pesq_skip_counts.get(combined_pesq_reason, 0) + 1
+                        )
+                    else:
+                        try:
+                            pesq_before.append(
+                                calculate_pesq(noisy_np, clean_np, config.sample_rate)
+                            )
+                            pesq_after.append(
+                                calculate_pesq(enhanced_np, clean_np, config.sample_rate)
+                            )
+                        except RuntimeError:
+                            pesq_ok = False
+
+    def m(values: List[float]) -> float:
+        return float(np.mean(values)) if values else float("nan")
+
+    # Report validity summary to console for monitoring during training.
+    stoi_n_valid = len(stoi_before)
+    stoi_n_skipped = sum(stoi_skip_counts.values())
+    if stoi_n_total > 0:
+        skip_detail = ", ".join(
+            f"{r}={c}" for r, c in sorted(stoi_skip_counts.items())
+        )
+        skip_str = f" [{skip_detail}]" if skip_detail else ""
+        print(
+            f"    STOI valid: {stoi_n_valid}/{stoi_n_total}"
+            f"  skipped: {stoi_n_skipped}/{stoi_n_total}{skip_str}"
+        )
+    pesq_n_valid = len(pesq_before)
+    pesq_n_skipped = sum(pesq_skip_counts.values())
+    if pesq_n_total > 0:
+        pesq_skip_detail = ", ".join(
+            f"{r}={c}" for r, c in sorted(pesq_skip_counts.items())
+        )
+        pesq_skip_str = f" [{pesq_skip_detail}]" if pesq_skip_detail else ""
+        print(
+            f"    PESQ valid: {pesq_n_valid}/{pesq_n_total}"
+            f"  skipped: {pesq_n_skipped}/{pesq_n_total}{pesq_skip_str}"
+        )
+
+    return {
+        "val_si_snr_before_db_full": m(si_before),
+        "val_si_snr_after_db_full": m(si_after),
+        "val_si_snr_improvement_db_full": m(si_after) - m(si_before)
+        if si_before and si_after
+        else float("nan"),
+        "val_reconstruction_snr_db_full": m(recon_snr),
+        "val_stoi_before": m(stoi_before),
+        "val_stoi_after": m(stoi_after),
+        "val_stoi_improvement": m(stoi_after) - m(stoi_before) if stoi_ok and stoi_before else float("nan"),
+        "val_pesq_before": m(pesq_before),
+        "val_pesq_after": m(pesq_after),
+        "val_pesq_improvement": m(pesq_after) - m(pesq_before) if pesq_ok and pesq_before else float("nan"),
+        # Validity counts for downstream logging.
+        "val_stoi_n_valid": float(stoi_n_valid),
+        "val_stoi_n_skipped": float(stoi_n_skipped),
+        "val_pesq_n_valid": float(pesq_n_valid),
+        "val_pesq_n_skipped": float(pesq_n_skipped),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Perceptual-metric (STOI / PESQ) validity constants
+# ---------------------------------------------------------------------------
+
+# Safety guard: absolute minimum array length.
+# pystoi's analysis window is ~256 ms; 4000 samples (0.25 s) is the hard
+# floor.  In practice every evaluation segment is padded to 32 000 samples
+# (2 s), so this check almost never fires — it exists to catch edge cases.
+_MIN_SAMPLES_FOR_STOI: int = 4000
+
+# Global-RMS guards.  If the whole-segment RMS is below these thresholds the
+# signal is silence or a collapsed model output and STOI/PESQ are undefined.
+_MIN_CLEAN_RMS: float = 1e-4
+_MIN_ESTIMATE_RMS: float = 1e-6
+
+# Active-frame-ratio guard (the primary check for zero-padded 2-second
+# segments).  pystoi works by splitting the signal into short-time frames,
+# removing frames it classifies as silent, then computing intelligibility
+# from the remaining frames.  When a 2-second segment contains only, say,
+# 0.3 s of real speech followed by 1.7 s of zero-padding, most frames are
+# removed and pystoi emits "Not enough STFT frames … Returning 1e-5".
+#
+# This check replicates that frame-activity logic BEFORE calling pystoi so
+# that such segments are skipped rather than scored with a spurious 1e-5.
+#
+# Frame length: 256 samples = 16 ms at 16 kHz (standard short-time energy
+# analysis window; shorter than pystoi's own 256 ms window so the check
+# is conservative — we only skip when the vast majority of frames are silent).
+_ACTIVITY_FRAME_LEN: int = 256          # 16 ms at 16 kHz
+_ACTIVITY_RMS_THRESHOLD: float = 1e-4   # same scale as _MIN_CLEAN_RMS
+_MIN_ACTIVE_FRAME_RATIO: float = 0.10   # at least 10 % of frames must be active
+
+
+def _check_perceptual_metrics_validity(
+    clean: np.ndarray,
+    estimate: np.ndarray,
+    sample_rate: int,
+) -> Optional[str]:
+    """Return None when (clean, estimate) are suitable for STOI/PESQ.
+
+    Return a short reason string when the pair should be SKIPPED:
+      - 'too_short'             : fewer than _MIN_SAMPLES_FOR_STOI samples
+      - 'length_mismatch'       : clean and estimate have different lengths
+      - 'silent_clean'          : whole-segment RMS < _MIN_CLEAN_RMS
+      - 'silent_estimate'       : whole-segment estimate RMS < _MIN_ESTIMATE_RMS
+      - 'insufficient_activity' : < _MIN_ACTIVE_FRAME_RATIO of 16 ms frames
+                                  in the clean reference exceed the activity
+                                  threshold — the segment is predominantly
+                                  zero-padded and pystoi would return 1e-5
+
+    The 'insufficient_activity' check is the primary defence against the
+    pystoi warning "Not enough STFT frames to compute intermediate
+    intelligibility measure after removing silent frames. Returning 1e-5."
+    A 2-second segment is 32,000 samples and always passes 'too_short', but
+    can still be overwhelmingly zero-padded if the source utterance was short.
+    """
+    # 1. Absolute length guard (safety net for unexpected short arrays).
+    if len(clean) < _MIN_SAMPLES_FOR_STOI or len(estimate) < _MIN_SAMPLES_FOR_STOI:
+        return "too_short"
+
+    # 2. Arrays must be the same length for aligned comparison.
+    if len(clean) != len(estimate):
+        return "length_mismatch"
+
+    clean_f = clean.astype(np.float64)
+
+    # 3. Global clean RMS — catches completely silent references.
+    clean_rms = float(np.sqrt(np.mean(clean_f ** 2)))
+    if clean_rms < _MIN_CLEAN_RMS:
+        return "silent_clean"
+
+    # 4. Global estimate RMS — catches fully collapsed model outputs.
+    est_rms = float(np.sqrt(np.mean(estimate.astype(np.float64) ** 2)))
+    if est_rms < _MIN_ESTIMATE_RMS:
+        return "silent_estimate"
+
+    # 5. Frame-level activity check (primary guard for zero-padded segments).
+    #    Split the clean reference into non-overlapping 16 ms frames and count
+    #    how many are energetic.  pystoi does the same internally and fails
+    #    when too few active frames remain; catching it here avoids 1e-5 scores.
+    n_frames = len(clean_f) // _ACTIVITY_FRAME_LEN
+    if n_frames == 0:
+        return "too_short"
+    frames = clean_f[: n_frames * _ACTIVITY_FRAME_LEN].reshape(n_frames, _ACTIVITY_FRAME_LEN)
+    frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    active_ratio = float(np.sum(frame_rms > _ACTIVITY_RMS_THRESHOLD) / n_frames)
+    if active_ratio < _MIN_ACTIVE_FRAME_RATIO:
+        return "insufficient_activity"
+
+    return None  # valid
+
 
 def _mean(values: List[float]) -> float:
     valid = [v for v in values if math.isfinite(v)]
@@ -751,6 +1272,30 @@ def _write_csv(
 # Test-set evaluation
 # ---------------------------------------------------------------------------
 
+def calculate_waveform_snr(clean: np.ndarray, estimate: np.ndarray) -> float:
+    """Waveform-based SNR: 10*log10(clean_power / error_power).
+
+    Both input and output SNR use this SAME formula so the improvement
+    (output_snr - input_snr) is mathematically meaningful.
+
+      INPUT_SNR  = calculate_waveform_snr(clean, noisy)
+      OUTPUT_SNR = calculate_waveform_snr(clean, enhanced)
+      IMPROVEMENT = OUTPUT_SNR - INPUT_SNR
+
+    The dataset metadata field 'measured_snr_db' (target_snr_db) is reported
+    separately as 'target_snr_db' and 'metadata_measured_snr_db' for reference
+    only; it is NOT used in the improvement calculation.
+    """
+    clean_f = clean.astype(np.float64)
+    estimate_f = estimate.astype(np.float64)
+    error = estimate_f - clean_f
+    return float(
+        10.0 * np.log10(
+            (np.mean(clean_f ** 2) + 1e-12) / (np.mean(error ** 2) + 1e-12)
+        )
+    )
+
+
 def evaluate_test_set(
     model: nn.Module,
     dataset: SpeechDataset,
@@ -759,9 +1304,10 @@ def evaluate_test_set(
 ) -> List[Dict[str, object]]:
     """Evaluate the held-out test split once without gradients or model selection.
 
-    Input SNR is taken from the dataset metadata (measured_snr_db), not
-    recomputed from clean/noisy waveforms.
-    Output (reconstruction) SNR is computed from the model output vs. clean.
+    BOTH input and output SNR are computed from waveforms using the same
+    formula: 10*log10(clean_power / error_power).  The metadata
+    'measured_snr_db' is reported as 'metadata_measured_snr_db' for reference
+    but is NOT mixed with the waveform-based SNR improvement.
     """
     model.eval()
     results: List[Dict[str, object]] = []
@@ -810,69 +1356,102 @@ def evaluate_test_set(
             compute_si_snr_metric(torch.from_numpy(enhanced_np.copy()), clean).item()
         )
 
-        # Reconstruction SNR: 10*log10(clean_power / error_power) where
-        # error = enhanced - clean.  This is NOT the environmental mixture SNR.
-        output_reconstruction_snr = calculate_snr(clean_np, enhanced_np)
+        # Waveform SNR — BOTH input and output use the SAME formula:
+        #   SNR = 10*log10(clean_power / error_power)
+        # This makes the improvement (output - input) mathematically valid.
+        waveform_input_snr = calculate_waveform_snr(clean_np, noisy_np)
+        waveform_output_snr = calculate_waveform_snr(clean_np, enhanced_np)
+        waveform_snr_improvement = _safe_diff(waveform_output_snr, waveform_input_snr)
 
-        # Dataset input SNR: taken directly from metadata generated at dataset
-        # creation time.  It is the measured mixture SNR of noisy vs. clean.
-        # Do NOT mix this with output_reconstruction_snr_db below.
+        # Dataset metadata SNR: reported for reference only.
+        # NOT mixed into the waveform_snr_improvement calculation.
         try:
-            measured_input_snr = float(metadata["measured_snr_db"])
+            metadata_measured_snr = float(metadata["measured_snr_db"])
         except (KeyError, ValueError):
-            measured_input_snr = float("nan")
+            metadata_measured_snr = float("nan")
 
         try:
             target_snr = float(metadata["target_snr_db"])
         except (KeyError, ValueError):
             target_snr = float("nan")
 
-        # SNR improvement = output_reconstruction_snr - measured_input_mixture_snr.
-        # These use different definitions and that is explicitly documented here.
-        snr_improvement = _safe_diff(output_reconstruction_snr, measured_input_snr)
-
         input_stoi = output_stoi = float("nan")
+        stoi_skip_reason: Optional[str] = None
         if stoi_available:
-            try:
-                input_stoi = calculate_stoi(noisy_np, clean_np, config.sample_rate)
-                output_stoi = calculate_stoi(enhanced_np, clean_np, config.sample_rate)
-            except RuntimeError as error:
-                stoi_available = False
-                stoi_error_msg = str(error)
-                print(f"  STOI unavailable: {error}")
+            # Check both (clean, noisy) and (clean, enhanced) before calling
+            # pystoi.  If either pair fails the validity check the sample is
+            # skipped for STOI; its reason is stored and counted at the end.
+            # This prevents pystoi's 1e-5 fallback value from entering the
+            # aggregate mean when audio is too short or nearly silent.
+            stoi_reason = _check_perceptual_metrics_validity(
+                clean_np, noisy_np, config.sample_rate
+            )
+            enh_stoi_reason = _check_perceptual_metrics_validity(
+                clean_np, enhanced_np, config.sample_rate
+            )
+            stoi_skip_reason = stoi_reason or enh_stoi_reason
+            if stoi_skip_reason is None:
+                try:
+                    input_stoi = calculate_stoi(noisy_np, clean_np, config.sample_rate)
+                    output_stoi = calculate_stoi(enhanced_np, clean_np, config.sample_rate)
+                except RuntimeError as error:
+                    stoi_available = False
+                    stoi_error_msg = str(error)
+                    print(f"  STOI unavailable: {error}")
 
         input_pesq = output_pesq = float("nan")
+        pesq_skip_reason: Optional[str] = None
         if pesq_available:
-            try:
-                input_pesq = calculate_pesq(noisy_np, clean_np, config.sample_rate)
-                output_pesq = calculate_pesq(enhanced_np, clean_np, config.sample_rate)
-            except RuntimeError as error:
-                pesq_available = False
-                pesq_error_msg = str(error)
-                print(f"  PESQ unavailable: {error}")
+            pesq_reason = _check_perceptual_metrics_validity(
+                clean_np, noisy_np, config.sample_rate
+            )
+            enh_pesq_reason = _check_perceptual_metrics_validity(
+                clean_np, enhanced_np, config.sample_rate
+            )
+            pesq_skip_reason = pesq_reason or enh_pesq_reason
+            if pesq_skip_reason is None:
+                try:
+                    input_pesq = calculate_pesq(noisy_np, clean_np, config.sample_rate)
+                    output_pesq = calculate_pesq(enhanced_np, clean_np, config.sample_rate)
+                except RuntimeError as error:
+                    pesq_available = False
+                    pesq_error_msg = str(error)
+                    print(f"  PESQ unavailable: {error}")
 
         results.append(
             {
                 "sample_id": metadata["sample_id"],
+                # target_snr_db: nominal SNR level from dataset generation.
                 "target_snr_db": target_snr,
-                # measured_input_snr_db: mixture SNR from dataset metadata.
-                "measured_input_snr_db": measured_input_snr,
-                # output_reconstruction_snr_db: 10*log10(clean_power/error_power).
-                "output_reconstruction_snr_db": output_reconstruction_snr,
-                # snr_improvement_db: output_reconstruction_snr - measured_input_mixture_snr.
-                "snr_improvement_db": snr_improvement,
+                # metadata_measured_snr_db: mixture SNR recorded at generation time.
+                # Reported for reference only; NOT used in snr_improvement calculation.
+                "metadata_measured_snr_db": metadata_measured_snr,
+                # waveform_input_snr_db: 10*log10(clean_power / (noisy-clean)^2 power).
+                "waveform_input_snr_db": waveform_input_snr,
+                # waveform_output_snr_db: 10*log10(clean_power / (enhanced-clean)^2 power).
+                "waveform_output_snr_db": waveform_output_snr,
+                # waveform_snr_improvement_db: waveform_output_snr - waveform_input_snr.
+                # Both use the SAME formula — the improvement is meaningful.
+                "waveform_snr_improvement_db": waveform_snr_improvement,
+                # SI-SNR (scale-invariant, dB, higher=better)
                 "input_si_snr_db": input_si,
                 "output_si_snr_db": output_si,
                 "si_snr_improvement_db": _safe_diff(output_si, input_si),
                 "input_stoi": input_stoi,
                 "output_stoi": output_stoi,
                 "stoi_improvement": _safe_diff(output_stoi, input_stoi),
+                # stoi_skip_reason: None = evaluated; string = why skipped.
+                "stoi_skip_reason": stoi_skip_reason or "",
                 "input_pesq": input_pesq,
                 "output_pesq": output_pesq,
                 "pesq_improvement": _safe_diff(output_pesq, input_pesq),
+                # pesq_skip_reason: None = evaluated; string = why skipped.
+                "pesq_skip_reason": pesq_skip_reason or "",
                 "noise_category": metadata.get("noise_category", ""),
                 "max_amplitude_enhanced": max_amp,
                 "rms_enhanced": rms,
+                # rms_ratio_enhanced_over_clean: target ~1.0.
+                "rms_ratio_enhanced_over_clean": rms / (float(np.sqrt(np.mean(clean_np ** 2))) + 1e-12),
                 "clipped_for_wav": clipped,
                 # Internal waveform arrays (excluded from CSV by prefix '_').
                 "_noisy": noisy_np,
@@ -880,6 +1459,45 @@ def evaluate_test_set(
                 "_enhanced": enhanced_np,
             }
         )
+
+    # Aggregate STOI/PESQ validity summary over the full test set.
+    # The mean STOI/PESQ printed later uses only samples where skip_reason == "".
+    # This block reports the counts explicitly so the user can see exactly
+    # how many samples were scored vs. skipped and why.
+    n_total = len(results)
+    stoi_skip_counts: Dict[str, int] = {}
+    pesq_skip_counts: Dict[str, int] = {}
+    for r in results:
+        sr = str(r.get("stoi_skip_reason", ""))
+        if sr:
+            stoi_skip_counts[sr] = stoi_skip_counts.get(sr, 0) + 1
+        pr = str(r.get("pesq_skip_reason", ""))
+        if pr:
+            pesq_skip_counts[pr] = pesq_skip_counts.get(pr, 0) + 1
+
+    stoi_n_skipped = sum(stoi_skip_counts.values())
+    stoi_n_valid = n_total - stoi_n_skipped
+    pesq_n_skipped = sum(pesq_skip_counts.values())
+    pesq_n_valid = n_total - pesq_n_skipped
+
+    def _pct(n: int, total: int) -> str:
+        return f"{100.0 * n / total:.2f}%" if total > 0 else "N/A"
+
+    print(f"\n  STOI evaluation coverage:")
+    print(f"    Valid  : {stoi_n_valid}/{n_total} ({_pct(stoi_n_valid, n_total)})")
+    print(f"    Skipped: {stoi_n_skipped}/{n_total} ({_pct(stoi_n_skipped, n_total)})", end="")
+    if stoi_skip_counts:
+        detail = ", ".join(f"{r}={c}" for r, c in sorted(stoi_skip_counts.items()))
+        print(f"  [{detail}]", end="")
+    print()
+
+    print(f"  PESQ evaluation coverage:")
+    print(f"    Valid  : {pesq_n_valid}/{n_total} ({_pct(pesq_n_valid, n_total)})")
+    print(f"    Skipped: {pesq_n_skipped}/{n_total} ({_pct(pesq_n_skipped, n_total)})", end="")
+    if pesq_skip_counts:
+        detail = ", ".join(f"{r}={c}" for r, c in sorted(pesq_skip_counts.items()))
+        print(f"  [{detail}]", end="")
+    print()
 
     if not stoi_available:
         print(f"\n  NOTE: STOI unavailable this run. {stoi_error_msg}")
@@ -902,10 +1520,12 @@ def evaluate_by_group(
 ) -> List[Dict[str, object]]:
     """Aggregate per-sample results by *key* and write a summary CSV."""
     metric_names = [
-        "measured_input_snr_db", "output_reconstruction_snr_db", "snr_improvement_db",
+        "metadata_measured_snr_db",
+        "waveform_input_snr_db", "waveform_output_snr_db", "waveform_snr_improvement_db",
         "input_si_snr_db", "output_si_snr_db", "si_snr_improvement_db",
         "input_stoi", "output_stoi", "stoi_improvement",
         "input_pesq", "output_pesq", "pesq_improvement",
+        "rms_ratio_enhanced_over_clean",
     ]
     groups: Dict[object, List[Dict[str, object]]] = {}
     for row in results:
@@ -1021,10 +1641,10 @@ def save_audio_examples(
                 {
                     "sample_id": sid,
                     "target_snr_db": row["target_snr_db"],
-                    "measured_input_snr_db": row["measured_input_snr_db"],
-                    # output_reconstruction_snr_db: reconstruction error vs. clean.
-                    "output_reconstruction_snr_db": row["output_reconstruction_snr_db"],
-                    "snr_improvement_db": row["snr_improvement_db"],
+                    "metadata_measured_snr_db": row["metadata_measured_snr_db"],
+                    "waveform_input_snr_db": row["waveform_input_snr_db"],
+                    "waveform_output_snr_db": row["waveform_output_snr_db"],
+                    "waveform_snr_improvement_db": row["waveform_snr_improvement_db"],
                     "noise_category": row.get("noise_category", ""),
                     "clipped_for_wav": row.get("clipped_for_wav", False),
                 },
@@ -1168,23 +1788,45 @@ def save_plots(
         x_pos = list(range(len(snr_labels)))
         width = 0.38
 
-        # 8. SNR improvement by target SNR
-        # snr_improvement = output_reconstruction_snr - measured_input_mixture_snr.
+        # 8. Waveform SNR improvement by target SNR
+        # Both input and output SNR use 10*log10(clean_power/error_power).
         snr_imp = [
-            float(r.get("mean_snr_improvement_db", float("nan")))
+            float(r.get("mean_waveform_snr_improvement_db", float("nan")))
+            for r in snr_summary
+        ]
+        in_snr = [
+            float(r.get("mean_waveform_input_snr_db", float("nan")))
+            for r in snr_summary
+        ]
+        out_snr = [
+            float(r.get("mean_waveform_output_snr_db", float("nan")))
             for r in snr_summary
         ]
         fig, ax = _fig(
-            "SNR Improvement by Target SNR\n"
-            "(output reconstruction SNR \u2212 measured input mixture SNR)",
-            "Mean SNR Improvement (dB)",
+            "Waveform SNR Improvement by Target SNR\n"
+            "(output_snr \u2212 input_snr, both waveform-based)",
+            "Mean Waveform SNR Improvement (dB)",
         )
         colors = ["#2176AE" if v >= 0 else "#E63946" for v in snr_imp]
         ax.bar(snr_labels, snr_imp, color=colors, edgecolor="white", linewidth=0.5)
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_xlabel("Target SNR (dB)", fontsize=11)
         fig.tight_layout()
-        fig.savefig(plot_dir / "snr_improvement_by_target_snr.png", dpi=150)
+        fig.savefig(plot_dir / "waveform_snr_improvement_by_target_snr.png", dpi=150)
+        plt.close(fig)
+
+        # 8b. Input vs Output waveform SNR by target SNR (line plot)
+        x_snr = list(range(len(snr_labels)))
+        fig, ax = _fig(
+            "Waveform SNR: Input vs Output by Target SNR",
+            "Mean Waveform SNR (dB)",
+        )
+        ax.plot(snr_labels, in_snr, "o-", color="#2176AE", lw=1.8, label="Input SNR")
+        ax.plot(snr_labels, out_snr, "s-", color="#F7882F", lw=1.8, label="Output SNR")
+        ax.set_xlabel("Target SNR (dB)", fontsize=11)
+        ax.legend(fontsize=10)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "waveform_snr_input_vs_output.png", dpi=150)
         plt.close(fig)
 
         # 9. STOI by target SNR
@@ -1217,6 +1859,32 @@ def save_plots(
         ax.legend(fontsize=10)
         fig.tight_layout()
         fig.savefig(plot_dir / "pesq_by_target_snr.png", dpi=150)
+        plt.close(fig)
+
+    # EXPERIMENT 2 ADDITION: RMS ratio and amplitude-loss curves. This is the
+    # single most important new plot in this file - it is what would have
+    # caught the Experiment-1 amplitude bug within the first few epochs
+    # instead of after a full, ~3-hour, 100-epoch run.
+    epochs = [int(h["epoch"]) for h in history]
+    if all("val_rms_ratio" in h for h in history):
+        fig, ax = _fig("RMS Ratio (Enhanced / Clean) Over Training", "RMS Ratio")
+        ax.plot(epochs, [h["train_rms_ratio"] for h in history], color="#2176AE", lw=1.8, label="Train")
+        ax.plot(epochs, [h["val_rms_ratio"] for h in history], color="#F7882F", lw=1.8, label="Validation")
+        ax.axhline(1.0, color="#26A96C", ls="--", lw=1.5, label="Target (1.0)")
+        ax.set_xlabel("Epoch", fontsize=11)
+        ax.legend(fontsize=10)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "rms_ratio_over_training.png", dpi=150)
+        plt.close(fig)
+
+    if all("val_amplitude_loss_db" in h for h in history):
+        fig, ax = _fig("Amplitude Consistency Loss Over Training", "Amplitude Loss (dB)")
+        ax.plot(epochs, [h["train_amplitude_loss_db"] for h in history], color="#7B2D8B", lw=1.8, label="Train")
+        ax.plot(epochs, [h["val_amplitude_loss_db"] for h in history], color="#C77DFF", lw=1.8, label="Validation")
+        ax.set_xlabel("Epoch", fontsize=11)
+        ax.legend(fontsize=10)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "amplitude_loss_over_training.png", dpi=150)
         plt.close(fig)
 
     print(f"Plots saved to {plot_dir}")
@@ -1268,6 +1936,10 @@ def save_model_report(
         "model_channels": list(config.model_channels),
         "si_snr_loss_weight": config.si_snr_weight,
         "spectral_loss_weight": config.spectral_loss_weight,
+        "amplitude_loss_weight": config.amplitude_loss_weight,
+        "waveform_loss_weight": config.waveform_loss_weight,
+        "snr_sampling_weights": config.snr_sampling_weights,
+        "use_snr_weighted_sampling": config.use_snr_weighted_sampling,
         "random_seed": config.random_seed,
         "device": str(device),
         "number_of_epochs_completed": len(history),
@@ -1275,9 +1947,10 @@ def save_model_report(
         "best_validation_loss": float(best["val_total_loss"]),  # type: ignore[arg-type]
         "dataset_counts": dataset_counts,
         "test_set_metrics": {
-            "mean_measured_input_snr_db": _agg("measured_input_snr_db"),
-            "mean_output_reconstruction_snr_db": _agg("output_reconstruction_snr_db"),
-            "mean_snr_improvement_db": _agg("snr_improvement_db"),
+            "mean_metadata_measured_snr_db": _agg("metadata_measured_snr_db"),
+            "mean_waveform_input_snr_db": _agg("waveform_input_snr_db"),
+            "mean_waveform_output_snr_db": _agg("waveform_output_snr_db"),
+            "mean_waveform_snr_improvement_db": _agg("waveform_snr_improvement_db"),
             "mean_input_si_snr_db": _agg("input_si_snr_db"),
             "mean_output_si_snr_db": _agg("output_si_snr_db"),
             "mean_si_snr_improvement_db": _agg("si_snr_improvement_db"),
@@ -1287,12 +1960,14 @@ def save_model_report(
             "mean_input_pesq": _agg("input_pesq"),
             "mean_output_pesq": _agg("output_pesq"),
             "mean_pesq_improvement": _agg("pesq_improvement"),
+            "mean_rms_ratio_enhanced_over_clean": _agg("rms_ratio_enhanced_over_clean"),
         },
-        "snr_improvement_note": (
-            "snr_improvement_db = output_reconstruction_snr_db - measured_input_snr_db. "
-            "These two quantities use different definitions: "
-            "output_reconstruction_snr_db measures 10*log10(clean_power/error_power); "
-            "measured_input_snr_db is the mixture SNR from dataset metadata."
+        "waveform_snr_formula_note": (
+            "waveform_snr = 10*log10(mean(clean^2) / mean((estimate-clean)^2)). "
+            "BOTH input SNR (noisy as estimate) and output SNR (enhanced as estimate) "
+            "use this SAME formula so waveform_snr_improvement = output_snr - input_snr "
+            "is mathematically valid. metadata_measured_snr_db is reported separately "
+            "and is NOT mixed into the improvement calculation."
         ),
     }
     report_path = config.output_dir / "model_report.json"
@@ -1371,25 +2046,29 @@ def print_final_summary(
     print()
     print("  Format: mean \u00b1 std  [min, max]")
     print()
-    print("  SNR  (note: improvement = output reconstruction SNR - input mixture SNR)")
-    print(f"    Measured Input SNR (mixture)    : {_fmt_stat('measured_input_snr_db', ' dB', True)}")
-    print(f"    Output Reconstruction SNR        : {_fmt_stat('output_reconstruction_snr_db', ' dB', True)}")
-    print(f"    SNR Improvement                  : {_fmt_stat('snr_improvement_db', ' dB', True)}")
+    print("  WAVEFORM SNR  (both input and output: 10*log10(clean_power/error_power))")
+    print(f"    Metadata Measured SNR (reference) : {_fmt_stat('metadata_measured_snr_db', ' dB', True)}")
+    print(f"    Waveform Input SNR                : {_fmt_stat('waveform_input_snr_db', ' dB', True)}")
+    print(f"    Waveform Output SNR               : {_fmt_stat('waveform_output_snr_db', ' dB', True)}")
+    print(f"    Waveform SNR Improvement          : {_fmt_stat('waveform_snr_improvement_db', ' dB', True)}")
     print()
-    print("  SI-SNR  (dB, higher is better)")
-    print(f"    Input SI-SNR                     : {_fmt_stat('input_si_snr_db', ' dB', True)}")
-    print(f"    Output SI-SNR                    : {_fmt_stat('output_si_snr_db', ' dB', True)}")
-    print(f"    SI-SNR Improvement               : {_fmt_stat('si_snr_improvement_db', ' dB', True)}")
+    print("  SI-SNR  (dB, scale-invariant, higher is better)")
+    print(f"    Input SI-SNR                      : {_fmt_stat('input_si_snr_db', ' dB', True)}")
+    print(f"    Output SI-SNR                     : {_fmt_stat('output_si_snr_db', ' dB', True)}")
+    print(f"    SI-SNR Improvement                : {_fmt_stat('si_snr_improvement_db', ' dB', True)}")
     print()
     print("  STOI  (0 to 1, higher is better)")
-    print(f"    Input STOI                       : {_fmt_stat('input_stoi')}")
-    print(f"    Output STOI                      : {_fmt_stat('output_stoi')}")
-    print(f"    STOI Improvement                 : {_fmt_stat('stoi_improvement', signed=True)}")
+    print(f"    Input STOI                        : {_fmt_stat('input_stoi')}")
+    print(f"    Output STOI                       : {_fmt_stat('output_stoi')}")
+    print(f"    STOI Improvement                  : {_fmt_stat('stoi_improvement', signed=True)}")
     print()
     print("  PESQ  (wideband, higher is better)")
-    print(f"    Input PESQ                       : {_fmt_stat('input_pesq')}")
-    print(f"    Output PESQ                      : {_fmt_stat('output_pesq')}")
-    print(f"    PESQ Improvement                 : {_fmt_stat('pesq_improvement', signed=True)}")
+    print(f"    Input PESQ                        : {_fmt_stat('input_pesq')}")
+    print(f"    Output PESQ                       : {_fmt_stat('output_pesq')}")
+    print(f"    PESQ Improvement                  : {_fmt_stat('pesq_improvement', signed=True)}")
+    print()
+    print("  AMPLITUDE / SCALE  (target ratio ~= 1.0; this is what Experiment 1 got wrong)")
+    print(f"    RMS ratio (enhanced / clean)      : {_fmt_stat('rms_ratio_enhanced_over_clean')}")
     print()
 
     # ------------------------------------------------------------------
@@ -1499,14 +2178,16 @@ def finalize_evaluation(
     detect_overfitting(history)
 
     print("\nSNR GROUP SUMMARY:")
-    print("  (output reconstruction SNR - measured input mixture SNR = improvement)")
+    print("  waveform_snr_improvement = waveform_output_snr - waveform_input_snr  (same formula)")
     for row in snr_summary:
         print(
             f"  Target {row.get('target_snr_db', '?'):>4} dB"
             f" | n={row['sample_count']:>3}"
-            f" | Input SNR={row.get('mean_measured_input_snr_db', float('nan')):+.1f} dB"
-            f" | Output Recon SNR={row.get('mean_output_reconstruction_snr_db', float('nan')):+.1f} dB"
+            f" | In SNR={row.get('mean_waveform_input_snr_db', float('nan')):+.1f} dB"
+            f" | Out SNR={row.get('mean_waveform_output_snr_db', float('nan')):+.1f} dB"
+            f" | SNR Imp={row.get('mean_waveform_snr_improvement_db', float('nan')):+.2f} dB"
             f" | SI-SNR Imp={row.get('mean_si_snr_improvement_db', float('nan')):+.2f} dB"
+            f" | RMS ratio={row.get('mean_rms_ratio_enhanced_over_clean', float('nan')):.2f}"
         )
 
     print("\nNOISE CATEGORY SUMMARY:")
@@ -1514,9 +2195,11 @@ def finalize_evaluation(
         print(
             f"  {str(row.get('noise_category', '?')):<32}"
             f" | n={row['sample_count']:>3}"
-            f" | Input SNR={row.get('mean_measured_input_snr_db', float('nan')):+.1f} dB"
-            f" | Output Recon SNR={row.get('mean_output_reconstruction_snr_db', float('nan')):+.1f} dB"
+            f" | In SNR={row.get('mean_waveform_input_snr_db', float('nan')):+.1f} dB"
+            f" | Out SNR={row.get('mean_waveform_output_snr_db', float('nan')):+.1f} dB"
+            f" | SNR Imp={row.get('mean_waveform_snr_improvement_db', float('nan')):+.2f} dB"
             f" | SI-SNR Imp={row.get('mean_si_snr_improvement_db', float('nan')):+.2f} dB"
+            f" | RMS ratio={row.get('mean_rms_ratio_enhanced_over_clean', float('nan')):.2f}"
         )
 
     return results, best_epoch, best_val_loss

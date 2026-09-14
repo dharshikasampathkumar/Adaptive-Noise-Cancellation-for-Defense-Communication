@@ -3,8 +3,8 @@
   "target_snr_db": -5.0,
   "metadata_measured_snr_db": -5.0,
   "waveform_input_snr_db": -4.057109499406571,
-  "waveform_output_snr_db": -4.0337323385278525,
-  "waveform_snr_improvement_db": 0.023377160878718328,
+  "waveform_output_snr_db": 2.957997104499711,
+  "waveform_snr_improvement_db": 7.015106603906282,
   "noise_category": "helicopter",
   "clipped_for_wav": false
 }

@@ -3,8 +3,8 @@
   "target_snr_db": 5.0,
   "metadata_measured_snr_db": 5.0,
   "waveform_input_snr_db": 5.912534758454308,
-  "waveform_output_snr_db": -5.110154830645608,
-  "waveform_snr_improvement_db": -11.022689589099915,
+  "waveform_output_snr_db": 8.592043055604892,
+  "waveform_snr_improvement_db": 2.6795082971505835,
   "noise_category": "drone",
   "clipped_for_wav": false
 }

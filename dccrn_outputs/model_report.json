@@ -35,9 +35,9 @@
   "use_snr_weighted_sampling": true,
   "random_seed": 42,
   "device": "cpu",
-  "number_of_epochs_completed": 83,
-  "best_epoch": 68,
-  "best_validation_loss": -6.375006513595581,
+  "number_of_epochs_completed": 85,
+  "best_epoch": 70,
+  "best_validation_loss": -11.380235118865967,
   "dataset_counts": {
     "train": 800,
     "validation": 100,
@@ -46,18 +46,18 @@
   "test_set_metrics": {
     "mean_metadata_measured_snr_db": 6.8,
     "mean_waveform_input_snr_db": 8.276097,
-    "mean_waveform_output_snr_db": -4.81726,
-    "mean_waveform_snr_improvement_db": -13.093357,
+    "mean_waveform_output_snr_db": 12.400376,
+    "mean_waveform_snr_improvement_db": 4.124279,
     "mean_input_si_snr_db": 8.05778,
-    "mean_output_si_snr_db": 11.899699,
-    "mean_si_snr_improvement_db": 3.84192,
+    "mean_output_si_snr_db": 12.044727,
+    "mean_si_snr_improvement_db": 3.986948,
     "mean_input_stoi": 0.832228,
-    "mean_output_stoi": 0.834883,
-    "mean_stoi_improvement": 0.002655,
+    "mean_output_stoi": 0.833605,
+    "mean_stoi_improvement": 0.001377,
     "mean_input_pesq": 1.776934,
-    "mean_output_pesq": 1.850538,
-    "mean_pesq_improvement": 0.073604,
-    "mean_rms_ratio_enhanced_over_clean": 0.784484
+    "mean_output_pesq": 1.754671,
+    "mean_pesq_improvement": -0.022263,
+    "mean_rms_ratio_enhanced_over_clean": 0.96396
   },
   "waveform_snr_formula_note": "waveform_snr = 10*log10(mean(clean^2) / mean((estimate-clean)^2)). BOTH input SNR (noisy as estimate) and output SNR (enhanced as estimate) use this SAME formula so waveform_snr_improvement = output_snr - input_snr is mathematically valid. metadata_measured_snr_db is reported separately and is NOT mixed into the improvement calculation."
 }

@@ -3,8 +3,8 @@
   "target_snr_db": 0.0,
   "metadata_measured_snr_db": 0.0,
   "waveform_input_snr_db": -1.021425341071458,
-  "waveform_output_snr_db": -4.997972604463719,
-  "waveform_snr_improvement_db": -3.976547263392261,
+  "waveform_output_snr_db": 9.627962854210804,
+  "waveform_snr_improvement_db": 10.649388195282262,
   "noise_category": "artillery",
   "clipped_for_wav": false
 }

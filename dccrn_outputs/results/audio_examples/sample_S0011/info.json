@@ -3,8 +3,8 @@
   "target_snr_db": -5.0,
   "metadata_measured_snr_db": -5.0,
   "waveform_input_snr_db": -6.988106471259343,
-  "waveform_output_snr_db": -5.280472653131224,
-  "waveform_snr_improvement_db": 1.7076338181281185,
+  "waveform_output_snr_db": 4.455403834418403,
+  "waveform_snr_improvement_db": 11.443510305677746,
   "noise_category": "armored_vehicle",
   "clipped_for_wav": false
 }

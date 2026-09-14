@@ -379,18 +379,32 @@ def istft(spectrogram: Tensor, config: Config, length: int) -> Tensor:
 # ---------------------------------------------------------------------------
 
 def si_snr_loss(estimate: Tensor, target: Tensor) -> Tensor:
-    """SI-SNR loss (lower is better; used for gradient optimisation).
+    """SI-SNR loss with non-negative projection.
 
-    This is the *negative* SI-SNR.  Its numeric value is NOT a dB SNR reading.
+    Lower is better. Negative SI-SNR is returned for optimisation.
+    The non-negative projection prevents a sign-inverted estimate
+    from receiving the same SI-SNR score as a correctly signed estimate.
     """
     estimate = estimate - estimate.mean(dim=-1, keepdim=True)
     target = target - target.mean(dim=-1, keepdim=True)
-    projection = (estimate * target).sum(-1, keepdim=True) * target
-    projection = projection / (target.pow(2).sum(-1, keepdim=True) + 1e-8)
+
+    dot = (estimate * target).sum(-1, keepdim=True)
+    target_energy = target.pow(2).sum(-1, keepdim=True) + 1e-8
+
+    alpha = dot / target_energy
+
+    # Prevent sign-inverted estimates from being rewarded by SI-SNR.
+    alpha = torch.clamp(alpha, min=0.0)
+
+    projection = alpha * target
+
     noise = estimate - projection
+
     score = 10 * torch.log10(
-        (projection.pow(2).sum(-1) + 1e-8) / (noise.pow(2).sum(-1) + 1e-8)
+        (projection.pow(2).sum(-1) + 1e-8)
+        / (noise.pow(2).sum(-1) + 1e-8)
     )
+
     return -score.mean()
 
 

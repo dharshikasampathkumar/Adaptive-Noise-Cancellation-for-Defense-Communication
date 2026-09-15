@@ -2,35 +2,41 @@
 
 Deployment pipeline
 -------------------
-    Primary WAV / waveform (float32, mono, 16 kHz)
-    ↓  preprocess (resample, normalise)
+    Primary audio / waveform (float32, mono, 16 kHz, range [-1.0, 1.0])
     ↓  STFT  (n_fft=512, hop=128, win=512, Hann, center=True)
     ↓  TinyDCCRN forward pass
     ↓  apply_crm: S_enh = (1 + M) * S_noisy
     ↓  iSTFT
     ↓  enhanced waveform (float32, mono, 16 kHz)
 
+Input Requirements
+------------------
+    - Sample rate: 16,000 Hz mono float32.
+    - Resampling to 16,000 Hz must be performed prior to invoking this interface.
+
 Reference microphone note
 -------------------------
-    The DCCRN accepts ONLY the primary (speech + noise) microphone.
+    The DCCRN accepts ONLY the primary (speech + noise) microphone signal.
     A separate reference microphone feeds the NLMS stage AFTER DCCRN.
-    Do NOT pass reference audio into this interface.
+    Do NOT pass stereo audio containing primary + reference channels into this interface.
+    If stereo audio is passed to enhance_file(), it is assumed to be a multi-channel
+    recording of the primary microphone array and averaged to mono.
 
 Streaming note
 --------------
     Audio transport chunk = 512 samples = 32 ms at 16 kHz.
-    512 samples is NOT a complete STFT input; DCCRNStreamer maintains an
-    internal overlap-add buffer so the GRU sees full temporal context.
+    DCCRNStreamer maintains a rolling 2.0-second (32,000-sample) context window
+    matching the training segment size, with Hanning boundary cross-fading across
+    consecutive 512-sample chunks.
 """
 from __future__ import annotations
 
 import time
-from collections import deque
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
 import soundfile as sf
+import torch
 from torch import Tensor
 
 from dccrn_model import (
@@ -45,7 +51,6 @@ from dccrn_model import (
     DEFAULT_SAMPLE_RATE,
     DEFAULT_SEGMENT_SAMPLES,
 )
-
 
 # ---------------------------------------------------------------------------
 # Audio constants  (match train_dccrn_3.py Config exactly)
@@ -92,8 +97,8 @@ class DCCRNInference:
 
     Usage::
 
-        inf = DCCRNInference(checkpoint_path="experiment3_best.pth")
-        enhanced_wav, sr = inf.enhance_file("noisy.wav")
+        inf = DCCRNInference(checkpoint_path="dccrn_quantized.pth")
+        enhanced_wav, sr = inf.enhance_file("noisy_primary.wav")
         sf.write("enhanced.wav", enhanced_wav, sr, subtype="PCM_16")
 
     Or from a numpy array::
@@ -108,9 +113,7 @@ class DCCRNInference:
         device: Optional[torch.device] = None,
         mask_bound: float = MASK_BOUND,
     ):
-        """
-        Provide either checkpoint_path (to load from disk) or a pre-loaded model.
-        """
+        """Provide either checkpoint_path (to load from disk) or a pre-loaded model."""
         self.device = device or torch.device("cpu")
         self.mask_bound = mask_bound
 
@@ -141,7 +144,7 @@ class DCCRNInference:
                 noisy_spec_padded = noisy_spec
 
             model_input = torch.stack(
-                (noisy_spec_padded.real, noisy_spec_padded.imag), dim=1       # [1, 2, F, Frames]
+                (noisy_spec_padded.real, noisy_spec_padded.imag), dim=1       # [1, 2, F, Frames_padded]
             )
             raw_output = self.model(model_input)                 # [1, 2, F, Frames_padded]
 
@@ -157,19 +160,19 @@ class DCCRNInference:
     # ------------------------------------------------------------------
 
     def enhance_array(self, waveform: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-        """Enhance a mono float32 numpy array [T,]. Returns float32 [T,].
+        """Enhance a primary-microphone float32 numpy array [T,]. Returns float32 [T,].
 
         Args:
-            waveform    : float32 1-D numpy array, 16 kHz mono
-            sample_rate : must equal 16000; checked but not used for resampling
+            waveform    : float32 1-D numpy array, 16 kHz mono primary mic audio.
+            sample_rate : must equal 16000 Hz.
 
         Returns:
-            enhanced float32 1-D numpy array of the same length
+            enhanced float32 1-D numpy array of the same length.
         """
         if sample_rate != SAMPLE_RATE:
             raise ValueError(
                 f"DCCRN requires {SAMPLE_RATE} Hz; got {sample_rate}. "
-                "Resample before passing to enhance_array()."
+                "Resample audio to 16,000 Hz before passing to enhance_array()."
             )
         waveform = waveform.astype(np.float32)
         t = torch.from_numpy(waveform).unsqueeze(0)  # [1, T]
@@ -185,16 +188,17 @@ class DCCRNInference:
         input_path: str,
         output_path: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
-        """Load a WAV, enhance it, optionally save, and return (array, sr).
+        """Load a primary-mic WAV, enhance it, optionally save, and return (array, sr).
 
-        The file is expected to be 16 kHz mono.  Stereo files are downmixed.
+        The file MUST be 16 kHz mono. Multi-channel primary-mic WAVs are averaged to mono.
+        Do NOT pass stereo files containing primary + reference channels.
         """
         audio, sr = sf.read(input_path, dtype="float32", always_2d=True)
-        audio = audio.mean(axis=1)   # downmix to mono
+        audio = audio.mean(axis=1)   # downmix multi-channel primary mic array to mono
         if sr != SAMPLE_RATE:
             raise ValueError(
                 f"Expected {SAMPLE_RATE} Hz WAV, got {sr} Hz: {input_path}. "
-                "Convert first with: sox input.wav -r 16000 output.wav"
+                "Resample first with sox or scipy before processing."
             )
         enhanced = self.enhance_array(audio, sr)
         if output_path is not None:
@@ -211,39 +215,15 @@ class DCCRNStreamer:
 
     Audio transport chunk: 512 samples = 32 ms at 16 kHz.
 
-    The DCCRN was trained on 2-second (32 000-sample) segments.  To handle
-    streaming chunks properly the streamer maintains an overlap-add buffer:
+    Maintains a rolling 2.0-second (32,000-sample) context window matching the
+    training segment size (251 STFT frames) to give the model full temporal context,
+    with Hanning boundary cross-fading across consecutive 512-sample chunks.
 
-        - Incoming chunks accumulate in an input ring-buffer.
-        - When at least one full processing block is available the model
-          runs inference on that block.
-        - The iSTFT output is overlap-added into an output buffer using
-          the hop_length stride.
-        - Enhanced samples are dequeued in exact 512-sample chunks.
-
-    The model is loaded ONCE and stays resident between chunks.
-    Do NOT recreate this object per chunk — that destroys GRU hidden state.
-
-    Streaming design
-    ----------------
-    - Block size = 32 × HOP_LENGTH = 32 × 128 = 4096 samples.
-      (A full 4096-sample block gives 32 STFT frames, which is a reasonable
-      context size; the model was trained on 251 frames but can generalise
-      to shorter blocks at the cost of some context.  A larger block reduces
-      latency variation.)
-    - Stride = HOP_LENGTH = 128 (one new STFT frame per hop).
-    - The actual algorithmic latency introduced by DCCRN is the block size.
-
-    Usage::
-
-        streamer = DCCRNStreamer(checkpoint_path="experiment3_best.pth")
-        for chunk in audio_hardware_chunks:
-            enhanced_chunk = streamer.process_chunk(chunk)
-            audio_output.write(enhanced_chunk)
-        streamer.reset()   # between utterances / calls
+    Guarantees:
+        - 1-to-1 matching: 512 samples in -> 512 enhanced samples out.
+        - Zero dropped or duplicated samples.
+        - Windowed overlap-add streaming context across consecutive 512-sample chunks.
     """
-
-    BLOCK_SIZE: int = 32 * HOP_LENGTH   # 4096 samples = 256 ms context
 
     def __init__(
         self,
@@ -251,11 +231,13 @@ class DCCRNStreamer:
         model: Optional[TinyDCCRN] = None,
         device: Optional[torch.device] = None,
         mask_bound: float = MASK_BOUND,
-        block_size: Optional[int] = None,
+        context_samples: int = DEFAULT_SEGMENT_SAMPLES, # 32,000 samples = 2.0 s
+        fade_samples: int = 128,
     ):
         self.device = device or torch.device("cpu")
         self.mask_bound = mask_bound
-        self.block_size = block_size or self.BLOCK_SIZE
+        self.context_samples = context_samples
+        self.fade_samples = fade_samples
 
         if model is not None:
             self.model = model.to(self.device)
@@ -265,85 +247,84 @@ class DCCRNStreamer:
             raise ValueError("Provide either checkpoint_path or model.")
 
         self.model.eval()
+        self.window = torch.hann_window(WIN_LENGTH, device=self.device)
+
+        if self.fade_samples > 0:
+            fade = 0.5 * (1.0 - np.cos(np.pi * np.arange(self.fade_samples) / self.fade_samples))
+            self.fade_in = fade.astype(np.float32)
+            self.fade_out = (1.0 - fade).astype(np.float32)
+        else:
+            self.fade_in = None
+
         self.reset()
 
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear all internal buffers and hidden state. Call between sessions."""
-        self._input_buffer: list[float] = []
-        self._output_buffer: list[float] = []
-        # Overlap-add accumulator: stores partially assembled output frames.
-        self._ola_buffer = np.zeros(self.block_size + N_FFT, dtype=np.float32)
-        # Track how many samples of the ola buffer have been committed.
-        self._ola_write_pos: int = 0
+        """Clear all internal rolling buffers and state between sessions."""
+        self._input_fifo = np.zeros(self.context_samples, dtype=np.float32)
+        self._prev_tail = np.zeros(self.fade_samples, dtype=np.float32)
 
     # ------------------------------------------------------------------
 
     def process_chunk(self, chunk: np.ndarray) -> np.ndarray:
-        """Process one 512-sample chunk. Returns a 512-sample enhanced chunk.
+        """Process one 512-sample chunk (32 ms). Returns a 512-sample enhanced chunk.
 
         Args:
             chunk : float32 numpy array of shape (512,) — primary mic only.
 
         Returns:
             enhanced_chunk : float32 numpy array of shape (512,).
-            If the internal buffer has not yet accumulated enough context,
-            the chunk is returned with a zero-latency pass-through until
-            the first full block is ready.
         """
-        if chunk.shape != (STREAM_CHUNK,):
-            # Accept any length; pad/trim for robustness.
-            if len(chunk) < STREAM_CHUNK:
-                chunk = np.pad(chunk, (0, STREAM_CHUNK - len(chunk)))
-            else:
-                chunk = chunk[:STREAM_CHUNK]
-
-        self._input_buffer.extend(chunk.tolist())
-        output = np.zeros(STREAM_CHUNK, dtype=np.float32)
-
-        while len(self._input_buffer) >= self.block_size:
-            block = np.array(self._input_buffer[:self.block_size], dtype=np.float32)
-            # Keep overlap: slide by HOP_LENGTH to preserve context.
-            self._input_buffer = self._input_buffer[HOP_LENGTH:]
-
-            enhanced_block = self._process_block(block)
-            self._output_buffer.extend(enhanced_block.tolist())
-
-        # Drain output buffer into the 512-sample return chunk.
-        if len(self._output_buffer) >= STREAM_CHUNK:
-            output = np.array(self._output_buffer[:STREAM_CHUNK], dtype=np.float32)
-            self._output_buffer = self._output_buffer[STREAM_CHUNK:]
+        if len(chunk) != STREAM_CHUNK:
+            c_arr = np.zeros(STREAM_CHUNK, dtype=np.float32)
+            c_arr[:min(len(chunk), STREAM_CHUNK)] = chunk[:STREAM_CHUNK]
+            chunk = c_arr
         else:
-            # Not enough output yet: pass-through until buffer fills.
-            available = len(self._output_buffer)
-            output[:available] = np.array(self._output_buffer, dtype=np.float32)
-            self._output_buffer = []
+            chunk = chunk.astype(np.float32)
 
-        return output
+        # Shift input FIFO left by 512 and append new 512-sample chunk
+        self._input_fifo[:-STREAM_CHUNK] = self._input_fifo[STREAM_CHUNK:]
+        self._input_fifo[-STREAM_CHUNK:] = chunk
 
-    # ------------------------------------------------------------------
+        # Compute STFT on rolling 2-second context window
+        win_tensor = torch.from_numpy(self._input_fifo).unsqueeze(0).to(self.device)
+        stft_spec = torch.stft(
+            win_tensor, N_FFT, HOP_LENGTH, WIN_LENGTH, self.window,
+            return_complex=True, center=True
+        )
 
-    def _process_block(self, block: np.ndarray) -> np.ndarray:
-        """Run DCCRN on a single block, return enhanced block (same length)."""
-        waveform = torch.from_numpy(block).unsqueeze(0).to(self.device)
-        length = waveform.shape[-1]
+        model_in = torch.stack((stft_spec.real, stft_spec.imag), dim=1)
+
         with torch.inference_mode():
-            noisy_spec = _stft(waveform, self.device)
-            model_input = torch.stack((noisy_spec.real, noisy_spec.imag), dim=1)
-            raw_output = self.model(model_input)
-            enhanced_spec, _ = apply_crm(raw_output, noisy_spec, self.mask_bound)
-            enhanced = _istft(enhanced_spec, length, self.device)
-        return enhanced.squeeze(0).cpu().numpy()
+            raw_out = self.model(model_in)
+            enh_spec, _ = apply_crm(raw_out, stft_spec, self.mask_bound)
+            synth_audio = torch.istft(
+                enh_spec, N_FFT, HOP_LENGTH, WIN_LENGTH, self.window,
+                length=self.context_samples, center=True
+            ).squeeze(0).cpu().numpy()
+
+        # Extract output corresponding to the latest 512-sample chunk
+        raw_chunk = synth_audio[-STREAM_CHUNK:].copy()
+
+        # Smooth boundary cross-fade with previous chunk's tail
+        if self.fade_in is not None:
+            raw_chunk[:self.fade_samples] = (
+                raw_chunk[:self.fade_samples] * self.fade_in +
+                self._prev_tail * self.fade_out
+            )
+            self._prev_tail = raw_chunk[-self.fade_samples:].copy()
+
+        return raw_chunk
 
     # ------------------------------------------------------------------
 
     @property
     def latency_samples(self) -> int:
-        """Algorithmic latency introduced by the streaming buffer (samples)."""
-        return self.block_size
+        """Algorithmic transport chunk latency in samples (512)."""
+        return STREAM_CHUNK
 
     @property
     def latency_ms(self) -> float:
-        """Algorithmic latency in milliseconds."""
-        return 1000.0 * self.block_size / SAMPLE_RATE
+        """Algorithmic transport chunk latency in milliseconds (32.0 ms)."""
+        return (STREAM_CHUNK / SAMPLE_RATE) * 1000.0

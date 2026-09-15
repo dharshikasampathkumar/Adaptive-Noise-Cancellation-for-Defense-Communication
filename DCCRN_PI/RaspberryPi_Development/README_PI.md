@@ -1,97 +1,122 @@
-# Raspberry Pi 3B+ Deployment — Experiment 3 Tiny DCCRN
+      # Raspberry Pi 3B+ Deployment Package — Experiment 3 Dynamic INT8 DCCRN
 
-This package provides the complete, isolated inference module for the **Experiment 3 Tiny DCCRN (Identity Residual)** speech enhancement model.
+      This package contains the complete, isolated inference module and testing suite for the **Experiment 3 Tiny DCCRN (Identity Residual)** speech enhancement model.
 
----
+      ---
 
-## 1. Quick Start Guide
+      ## Package Directory Layout
 
-### Prerequisites (Raspberry Pi 3B+ or Laptop)
+      ```text
+      RaspberryPi_Development/
+      ├── model/
+      │   └── dccrn_quantized.pth       # Dynamic INT8 Quantized Checkpoint (4.52 MB)
+      ├── src/
+      │   ├── config.py                 # Audio & STFT parameters
+      │   ├── dccrn_model.py            # Experiment 3 TinyDCCRN architecture
+      │   └── dccrn_interface.py        # Offline (DCCRNInference) & Streaming (DCCRNStreamer)
+      ├── tests/
+      │   ├── test_pi_inference.py      # Offline WAV evaluation script
+      │   └── test_streaming.py        # 512-sample real-time streaming test
+      ├── requirements.txt              # Minimal Pi dependencies
+      ├── README_PI.md                  # Integration & execution documentation
+      └── run_pi_test.py                # Single-command Pi validation runner
+      ```
 
-```bash
-# Core dependencies
-pip install torch numpy soundfile
-```
+      ---
 
----
+      ## 1. System Preparation on Raspberry Pi 3B+
 
-## 2. Integration Boundary (Team Hand-off Interface)
+      ### Step 1.1: Verify 64-Bit OS Architecture
 
-### Standard Whole-File Interface (`DCCRNInference`)
+      PyTorch official ARM wheels require a **64-bit Linux OS** (aarch64 / arm64).
 
-For processing complete audio files or buffers:
+      Run on Raspberry Pi terminal:
 
-```python
-import soundfile as sf
-from dccrn_model import load_checkpoint, load_quantized_model
-from dccrn_interface import DCCRNInference
+      ```bash
+      python3 --version
+      uname -m
+      ```
 
-# Load model (FP32 or INT8 Quantized)
-model, stft_config = load_checkpoint("dccrn_fp32_best.pth", device="cpu")
-# OR for quantized model:
-# model, stft_config = load_quantized_model("dccrn_quantized.pth")
+      *Required output for `uname -m`*: `aarch64` or `arm64`.
 
-# Initialize inference engine
-engine = DCCRNInference(model=model, stft_config=stft_config, device="cpu")
+      ---
 
-# Load noisy audio (16 kHz mono float32)
-noisy_audio, sr = sf.read("input_noisy.wav", dtype="float32")
+      ### Step 1.2: Install PyTorch & Dependencies
 
-# Enhance audio
-enhanced_audio = engine.process_waveform(noisy_audio)
+      Refer to official PyTorch installation guidance for ARM 64-bit devices:
 
-# Save result
-sf.write("output_enhanced.wav", enhanced_audio, sr)
-```
+      ```bash
+      # Update system packages
+      sudo apt-get update
+      sudo apt-get install -y python3-pip libsndfile1
 
----
+      # Install requirements
+      pip3 install -r requirements.txt
+      ```
 
-### Real-Time Block-by-Block Streaming Interface (`DCCRNStreamer`)
+      ---
 
-For streaming audio frame-by-frame (e.g. from primary microphone stream before downstream NLMS/NLSM processing):
+      ## 2. Running Deployment Tests on Raspberry Pi
 
-- **Frame Size**: 512 samples (32 ms at 16 kHz)
-- **Hop Size**: 128 samples (8 ms at 16 kHz)
+      Run the single-command validation launcher with any 16 kHz mono test WAV:
 
-```python
-import numpy as np
-from dccrn_model import load_checkpoint
-from dccrn_interface import DCCRNStreamer
+      ```bash
+      python3 run_pi_test.py --wav sample.wav
+      ```
 
-# Load model & create streamer
-model, stft_config = load_checkpoint("dccrn_fp32_best.pth", device="cpu")
-streamer = DCCRNStreamer(model=model, stft_config=stft_config, device="cpu")
+      The runner executes:
+      1. System hardware audit (OS, architecture, Python, PyTorch).
+      2. Offline WAV enhancement & diagnostics (load time, inference time, RTF, RAM usage).
+      3. 512-sample streaming chunk evaluation (chunk latency, Max compute time, Streaming RTF).
+      4. Prints the final classification: **REAL-TIME CAPABLE ON RASPBERRY PI 3B+** or **NOT REAL-TIME CAPABLE**.
 
-# Stream processing loop (example chunk of 512 samples)
-# In real application, pass incoming 512-sample buffer from primary mic
-mic_chunk = np.zeros(512, dtype=np.float32) 
-enhanced_chunk = streamer.process_chunk(mic_chunk)
+      ---
 
-# Reset internal GRU hidden state and STFT buffer between separate recordings/calls
-streamer.reset()
-```
+      ## 3. Final Team Integration Interface
 
----
+      For teammates integrating with primary microphone input and downstream NLMS / NLSM processing:
 
-## 3. Verification & Testing Commands
+      ### Input / Output Specification
 
-To test deployment on laptop or Pi:
+      - **Input format**: 16,000 Hz, 16-bit PCM converted to `float32`, mono, **512 samples** (32 ms).
+      - **Output format**: Enhanced 16,000 Hz `float32`, mono, **512 samples**.
 
-```bash
-# Run baseline FP32 deployment test
-python test_deployment.py --checkpoint dccrn_fp32_best.pth --audio-dir test_samples/
+      ### Team Code Integration Example
 
-# Run quantized INT8 deployment test
-python test_deployment.py --checkpoint dccrn_quantized.pth --quantized --audio-dir test_samples/
-```
+      ```python
+      import numpy as np
+      from src.dccrn_model import load_quantized_model
+      from src.dccrn_interface import DCCRNStreamer
 
----
+      # 1. Initialize model & streamer once during startup
+      model, _ = load_quantized_model("model/dccrn_quantized.pth")
+      streamer = DCCRNStreamer(model=model, device="cpu")
 
-## 4. Performance Specifications
+      # 2. In audio callback loop (512-sample incoming buffer from primary mic):
+      def on_primary_mic_audio(primary_mic_chunk_512: np.ndarray):
+      # Process through DCCRN INT8
+      enhanced_chunk = streamer.process_chunk(primary_mic_chunk_512)
+      
+      # Pass enhanced_chunk to downstream NLMS/NLSM filter with reference mic
+      nlms_filter.process(primary_enhanced=enhanced_chunk, reference_mic=ref_mic_chunk)
+      ```
 
-- **Sampling Rate**: 16,000 Hz (16 kHz)
-- **FFT Size**: 512
-- **Hop Size**: 128 (75% overlap)
-- **Model Parameters**: ~4.41M
-- **FP32 Size**: ~16.83 MB
-- **INT8 Quantized Size**: ~4.35 MB
+      ---
+
+      ## 4. End-to-End System Audio Pipeline
+
+      ```text
+      Primary INMP441 Mic
+            ↓
+      16 kHz / Mono / 512 Samples
+            ↓
+      DCCRN INT8 (dccrn_quantized.pth)
+            ↓
+      Enhanced Speech (512 Samples)
+            ↓
+      NLMS / NLSM Adaptive Filter ← Reference INMP441 Mic
+            ↓
+      DAC / Audio Output
+            ↓
+      Headset
+      ```

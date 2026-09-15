@@ -1,8 +1,5 @@
-# Deployment Requirements for Raspberry Pi 3B+ / Edge Devices
+# Raspberry Pi 3B+ Minimal Deployment Requirements
 torch>=2.0.0
 numpy>=1.22.0
 soundfile>=0.12.1
-
-# Optional for evaluation metrics on laptop (not needed on Pi for pure inference)
-# pystoi>=0.3.3
-# pesq>=0.0.4
+psutil>=5.9.0

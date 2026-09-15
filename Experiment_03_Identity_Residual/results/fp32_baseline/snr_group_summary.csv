@@ -1,0 +1,7 @@
+target_snr_db,sample_count,mean_waveform_input_snr_db,mean_waveform_output_snr_db,mean_waveform_snr_improvement_db,mean_input_si_snr_db,mean_output_si_snr_db,mean_si_snr_improvement_db,mean_input_stoi,mean_output_stoi,mean_stoi_improvement,mean_input_pesq,mean_output_pesq,mean_pesq_improvement,mean_rms_ratio_enhanced_over_clean,mean_clipping_pct
+-5.0,16,-3.0128,4.6307,7.6435,-4.248,4.2747,8.5227,0.6582,0.7182,0.06,1.2186,1.3283,0.1097,0.8063,nan
+0.0,20,0.9997,8.7207,7.721,0.4562,7.7221,7.2659,0.7231,0.7773,0.0542,1.318,1.6448,0.3269,0.9452,nan
+5.0,15,5.6069,12.2492,6.6423,5.4623,12.2904,6.828,0.8139,0.8532,0.0393,1.3852,1.8905,0.5053,0.9671,nan
+10.0,21,12.1022,17.4339,5.3317,12.0369,17.6184,5.5815,0.9265,0.9378,0.0113,1.9001,2.4704,0.5702,0.9904,0.0001
+15.0,17,16.4896,20.3302,3.8406,17.2111,20.6833,3.4722,0.9465,0.946,-0.0006,2.4516,2.7741,0.3225,0.9883,nan
+20.0,11,21.5679,21.9401,0.3722,21.5749,21.9736,0.3987,0.9521,0.9481,-0.004,2.6799,3.0157,0.3359,1.0028,nan

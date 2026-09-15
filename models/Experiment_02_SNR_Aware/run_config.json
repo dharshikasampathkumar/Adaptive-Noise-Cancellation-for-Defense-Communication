@@ -1,0 +1,57 @@
+{
+  "config": {
+    "root": "C:\\SIH\\synthetic_dataset",
+    "sample_rate": 16000,
+    "n_fft": 512,
+    "hop_length": 128,
+    "win_length": 512,
+    "segment_seconds": 2.0,
+    "batch_size": 4,
+    "learning_rate": 0.0002,
+    "num_epochs": 100,
+    "short_epochs": 3,
+    "gru_hidden_size": 128,
+    "gru_layers": 1,
+    "model_channels": [
+      16,
+      32,
+      64
+    ],
+    "si_snr_weight": 1.0,
+    "spectral_loss_weight": 1.0,
+    "amplitude_loss_weight": 0.3,
+    "full_val_metrics_every": 5,
+    "waveform_loss_weight": 50.0,
+    "snr_sampling_weights": {
+      "-5.0": 3.0,
+      "0.0": 2.5,
+      "5.0": 2.0,
+      "10.0": 1.0,
+      "15.0": 1.0,
+      "20.0": 1.0
+    },
+    "use_snr_weighted_sampling": true,
+    "transparency_loss_weights": {
+      "-5.0": 0.0,
+      "0.0": 0.0,
+      "5.0": 0.0,
+      "10.0": 5.0,
+      "15.0": 20.0,
+      "20.0": 40.0
+    },
+    "use_transparency_loss": true,
+    "experiment_name": "Experiment_02_SNR_Aware",
+    "models_root": "C:\\SIH\\models",
+    "random_seed": 42,
+    "patience": 15,
+    "output_dir": "C:\\SIH\\models\\Experiment_02_SNR_Aware"
+  },
+  "random_seed": 42,
+  "python_version": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+  "pytorch_version": "2.14.0+cpu",
+  "numpy_version": "2.4.1",
+  "operating_system": "Windows-11-10.0.26200-SP0",
+  "device": "cpu",
+  "cuda_available": false,
+  "gpu_name": "N/A"
+}

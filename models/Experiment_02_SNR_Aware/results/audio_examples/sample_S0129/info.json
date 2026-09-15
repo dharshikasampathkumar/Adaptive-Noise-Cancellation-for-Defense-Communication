@@ -1,0 +1,10 @@
+{
+  "sample_id": "S0129",
+  "target_snr_db": -5.0,
+  "metadata_measured_snr_db": -5.0,
+  "waveform_input_snr_db": -4.057109499406571,
+  "waveform_output_snr_db": 2.8669941437853916,
+  "waveform_snr_improvement_db": 6.9241036431919625,
+  "noise_category": "helicopter",
+  "clipped_for_wav": false
+}

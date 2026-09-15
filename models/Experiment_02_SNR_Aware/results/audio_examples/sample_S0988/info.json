@@ -1,0 +1,10 @@
+{
+  "sample_id": "S0988",
+  "target_snr_db": 20.0,
+  "metadata_measured_snr_db": 20.0,
+  "waveform_input_snr_db": 20.15875122613028,
+  "waveform_output_snr_db": 20.931325379083383,
+  "waveform_snr_improvement_db": 0.7725741529531014,
+  "noise_category": "wind",
+  "clipped_for_wav": false
+}

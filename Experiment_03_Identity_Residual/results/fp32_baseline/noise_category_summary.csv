@@ -1,0 +1,8 @@
+noise_category,sample_count,mean_waveform_input_snr_db,mean_waveform_output_snr_db,mean_waveform_snr_improvement_db,mean_input_si_snr_db,mean_output_si_snr_db,mean_si_snr_improvement_db,mean_input_stoi,mean_output_stoi,mean_stoi_improvement,mean_input_pesq,mean_output_pesq,mean_pesq_improvement,mean_rms_ratio_enhanced_over_clean,mean_clipping_pct
+armored_vehicle,13,7.6294,13.4224,5.7931,7.4165,12.921,5.5045,0.7807,0.8147,0.034,1.5158,1.8719,0.3561,0.9541,nan
+artillery,16,6.9745,12.8934,5.9189,7.366,13.0252,5.6593,0.7941,0.8275,0.0334,1.835,2.295,0.46,0.8933,0.0002
+drone,13,10.2702,16.1097,5.8396,10.0687,15.7588,5.6902,0.9277,0.9332,0.0055,2.1232,2.5493,0.4261,1.0064,nan
+gunshot,14,11.7974,15.5329,3.7355,11.7184,15.4408,3.7225,0.8744,0.8915,0.0171,2.2718,2.4041,0.1323,0.9882,nan
+helicopter,14,6.8064,13.4603,6.6539,6.7023,12.8549,6.1526,0.836,0.875,0.039,1.6654,1.9202,0.2548,0.9647,nan
+siren,17,6.9614,12.4421,5.4807,6.356,12.5572,6.2012,0.7782,0.8167,0.0385,1.471,1.9247,0.4537,0.9305,nan
+wind,13,8.0406,13.6674,5.6268,7.2825,13.8192,6.5367,0.8565,0.8819,0.0254,1.6075,2.097,0.4896,0.9234,nan

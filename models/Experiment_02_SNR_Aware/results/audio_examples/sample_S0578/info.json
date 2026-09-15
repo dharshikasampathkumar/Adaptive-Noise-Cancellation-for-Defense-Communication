@@ -1,0 +1,10 @@
+{
+  "sample_id": "S0578",
+  "target_snr_db": 10.0,
+  "metadata_measured_snr_db": 10.0,
+  "waveform_input_snr_db": 9.60968114930871,
+  "waveform_output_snr_db": 12.526923309959287,
+  "waveform_snr_improvement_db": 2.917242160650577,
+  "noise_category": "siren",
+  "clipped_for_wav": false
+}

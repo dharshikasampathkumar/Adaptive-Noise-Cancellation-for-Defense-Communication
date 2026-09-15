@@ -1,0 +1,2 @@
+model_type,source_checkpoint,checkpoint_mb,mean_input_snr_db,mean_output_snr_db,mean_snr_improvement_db,mean_input_sisnr_db,mean_output_sisnr_db,mean_sisnr_improvement_db,mean_stoi,mean_stoi_improvement,mean_pesq,mean_pesq_improvement,mean_rms_ratio,mean_rtf,mean_latency_ms
+Quantized INT8 (GRU+Linear),C:\SIH\Experiment_03_Identity_Residual\checkpoints\Experiment_03_best.pth,4.52,8.2761,13.8524,5.5763,8.0578,13.7098,5.652,0.8602,0.028,2.1479,0.371,0.9512,0.02,0.0012

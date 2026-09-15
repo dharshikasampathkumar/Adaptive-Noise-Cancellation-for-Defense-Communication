@@ -1,0 +1,112 @@
+{
+  "n_samples": 10,
+  "mean_waveform_snr_db": 32.29647930619837,
+  "mean_rms_ratio": 1.0043097277178956,
+  "mean_waveform_correlation": 0.9995764457536243,
+  "mean_mask_magnitude": 0.17739106714725494,
+  "mean_p95_mask_magnitude": 0.634423342347145,
+  "mean_max_mask_magnitude": 1.514001202583313,
+  "mean_clipping_pct": 0.0025,
+  "per_sample": [
+    {
+      "sample_id": "S0011",
+      "waveform_snr_db": 27.729553724525708,
+      "rms_ratio": 1.0058186166558232,
+      "waveform_correlation": 0.9991795897927455,
+      "mean_mask_magnitude": 0.21413865685462952,
+      "p95_mask_magnitude": 0.7348311543464661,
+      "max_mask_magnitude": 1.6281739473342896,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0016",
+      "waveform_snr_db": 36.53924636154562,
+      "rms_ratio": 1.0047822477829942,
+      "waveform_correlation": 0.9999015110387308,
+      "mean_mask_magnitude": 0.1349542886018753,
+      "p95_mask_magnitude": 0.6001803278923035,
+      "max_mask_magnitude": 1.5057661533355713,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0019",
+      "waveform_snr_db": 38.52692452976817,
+      "rms_ratio": 1.00371472346592,
+      "waveform_correlation": 0.9999550099659572,
+      "mean_mask_magnitude": 0.08756037801504135,
+      "p95_mask_magnitude": 0.35054418444633484,
+      "max_mask_magnitude": 1.1626050472259521,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0023",
+      "waveform_snr_db": 33.09889619582389,
+      "rms_ratio": 1.0074740001875861,
+      "waveform_correlation": 0.9997845936327973,
+      "mean_mask_magnitude": 0.16627301275730133,
+      "p95_mask_magnitude": 0.645294725894928,
+      "max_mask_magnitude": 1.5293129682540894,
+      "clipping_pct": 0.003125
+    },
+    {
+      "sample_id": "S0033",
+      "waveform_snr_db": 31.86828037664955,
+      "rms_ratio": 1.0080675743466228,
+      "waveform_correlation": 0.9997097171200044,
+      "mean_mask_magnitude": 0.20856820046901703,
+      "p95_mask_magnitude": 0.6967291831970215,
+      "max_mask_magnitude": 1.7452377080917358,
+      "clipping_pct": 0.021875000000000002
+    },
+    {
+      "sample_id": "S0045",
+      "waveform_snr_db": 36.30576910663017,
+      "rms_ratio": 1.000624784641319,
+      "waveform_correlation": 0.9998832140797043,
+      "mean_mask_magnitude": 0.19777092337608337,
+      "p95_mask_magnitude": 0.6899598836898804,
+      "max_mask_magnitude": 1.7758983373641968,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0053",
+      "waveform_snr_db": 27.797830639858425,
+      "rms_ratio": 1.0035704205673186,
+      "waveform_correlation": 0.9991795107330632,
+      "mean_mask_magnitude": 0.17121633887290955,
+      "p95_mask_magnitude": 0.6277822256088257,
+      "max_mask_magnitude": 1.5469309091567993,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0071",
+      "waveform_snr_db": 34.03674421432142,
+      "rms_ratio": 1.0059433499413057,
+      "waveform_correlation": 0.999822504039446,
+      "mean_mask_magnitude": 0.24479427933692932,
+      "p95_mask_magnitude": 0.7968056797981262,
+      "max_mask_magnitude": 1.690704345703125,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0078",
+      "waveform_snr_db": 31.1226129416017,
+      "rms_ratio": 1.0019385155726301,
+      "waveform_correlation": 0.9996197388864554,
+      "mean_mask_magnitude": 0.08558278530836105,
+      "p95_mask_magnitude": 0.3631513714790344,
+      "max_mask_magnitude": 1.048580288887024,
+      "clipping_pct": 0.0
+    },
+    {
+      "sample_id": "S0081",
+      "waveform_snr_db": 25.93893497125904,
+      "rms_ratio": 1.0011630440174357,
+      "waveform_correlation": 0.9987290682473381,
+      "mean_mask_magnitude": 0.2630518078804016,
+      "p95_mask_magnitude": 0.8389546871185303,
+      "max_mask_magnitude": 1.5068023204803467,
+      "clipping_pct": 0.0
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "model_type": "Quantized INT8 (GRU+Linear)",
+  "source_checkpoint": "C:\\SIH\\Experiment_03_Identity_Residual\\checkpoints\\Experiment_03_best.pth",
+  "checkpoint_mb": 4.52,
+  "mean_input_snr_db": 8.2761,
+  "mean_output_snr_db": 13.8524,
+  "mean_snr_improvement_db": 5.5763,
+  "mean_input_sisnr_db": 8.0578,
+  "mean_output_sisnr_db": 13.7098,
+  "mean_sisnr_improvement_db": 5.652,
+  "mean_stoi": 0.8602,
+  "mean_stoi_improvement": 0.028,
+  "mean_pesq": 2.1479,
+  "mean_pesq_improvement": 0.371,
+  "mean_rms_ratio": 0.9512,
+  "mean_rtf": 0.02,
+  "mean_latency_ms": 0.0012
+}

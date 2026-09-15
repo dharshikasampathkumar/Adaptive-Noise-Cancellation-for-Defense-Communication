@@ -1,0 +1,10 @@
+{
+  "sample_id": "S0389",
+  "target_snr_db": 5.0,
+  "metadata_measured_snr_db": 5.0,
+  "waveform_input_snr_db": 5.912534758454308,
+  "waveform_output_snr_db": 8.164614308821896,
+  "waveform_snr_improvement_db": 2.252079550367588,
+  "noise_category": "drone",
+  "clipped_for_wav": false
+}
